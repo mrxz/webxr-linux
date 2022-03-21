@@ -20,7 +20,7 @@ diff --git a/gfx/gl/SharedSurfaceGL.cpp b/gfx/gl/SharedSurfaceGL.cpp
  UniquePtr<SharedSurface_Basic> SharedSurface_Basic::Create(
      const SharedSurfaceDesc& desc) {
    auto fb = MozFramebuffer::Create(desc.gl, desc.size, 0, false);
-@@ -29,7 +33,32 @@ SharedSurface_Basic::SharedSurface_Basic
+@@ -29,7 +33,25 @@ SharedSurface_Basic::SharedSurface_Basic
      : SharedSurface(desc, std::move(fb)) {}
  
  Maybe<layers::SurfaceDescriptor> SharedSurface_Basic::ToSurfaceDescriptor() {
@@ -36,13 +36,6 @@ diff --git a/gfx/gl/SharedSurfaceGL.cpp b/gfx/gl/SharedSurfaceGL.cpp
 +  mDesc.gl->fBindFramebuffer(LOCAL_GL_FRAMEBUFFER, mFb->mFB);
 +  mDesc.gl->fReadPixels(0, 0, width, height, LOCAL_GL_RGBA,
 +                        LOCAL_GL_UNSIGNED_BYTE, pixelsBuffer);
-+
-+  // Rows are in inverse order, so reverse them.
-+  for (int line = 0; line != height / 2; ++line) {
-+    std::swap_ranges(pixelsBuffer + 4 * width * line,
-+                     pixelsBuffer + 4 * width * (line + 1),
-+                     pixelsBuffer + 4 * width * (height - line - 1));
-+  }
 +
 +  // HACK: pass along the pointer to the pixelsBuffer in the 'fence' field.
 +  return Some(layers::SurfaceDescriptorSharedGLTexture(
@@ -195,7 +188,7 @@ diff --git a/gfx/vr/service/OpenVRSession.cpp b/gfx/vr/service/OpenVRSession.cpp
  #endif
  
  bool OpenVRSession::SubmitFrame(const VRLayerTextureHandle& aTextureHandle,
-@@ -1303,11 +1313,25 @@ bool OpenVRSession::SubmitFrame(const VR
+@@ -1303,32 +1313,46 @@ bool OpenVRSession::SubmitFrame(const VR
  
    CFTypeRefPtr<IOSurfaceRef> ioSurface = surf->GetIOSurfaceRef();
    tex.handle = (void*)ioSurface.get();
@@ -224,7 +217,12 @@ diff --git a/gfx/vr/service/OpenVRSession.cpp b/gfx/vr/service/OpenVRSession.cpp
  
    ::vr::VRTextureBounds_t bounds;
    bounds.uMin = aLeftEyeRect.x;
-@@ -1318,7 +1342,7 @@ bool OpenVRSession::SubmitFrame(const VR
+-  bounds.vMin = 1.0 - aLeftEyeRect.y;
++  bounds.vMin = 1.0 - (aLeftEyeRect.y + aLeftEyeRect.height);
+   bounds.uMax = aLeftEyeRect.x + aLeftEyeRect.width;
+-  bounds.vMax = 1.0 - (aLeftEyeRect.y + aLeftEyeRect.height);
++  bounds.vMax = 1.0 - aLeftEyeRect.y;
+ 
    ::vr::EVRCompositorError err;
    err = mVRCompositor->Submit(::vr::EVREye::Eye_Left, &tex, &bounds);
    if (err != ::vr::EVRCompositorError::VRCompositorError_None) {
@@ -233,7 +231,11 @@ diff --git a/gfx/vr/service/OpenVRSession.cpp b/gfx/vr/service/OpenVRSession.cpp
    }
  
    bounds.uMin = aRightEyeRect.x;
-@@ -1328,7 +1352,7 @@ bool OpenVRSession::SubmitFrame(const VR
+-  bounds.vMin = 1.0 - aRightEyeRect.y;
++  bounds.vMin = 1.0 - (aRightEyeRect.y + aRightEyeRect.height);
+   bounds.uMax = aRightEyeRect.x + aRightEyeRect.width;
+-  bounds.vMax = 1.0 - (aRightEyeRect.y + aRightEyeRect.height);
++  bounds.vMax = 1.0 - aRightEyeRect.y;
  
    err = mVRCompositor->Submit(::vr::EVREye::Eye_Right, &tex, &bounds);
    if (err != ::vr::EVRCompositorError::VRCompositorError_None) {
