@@ -6,7 +6,7 @@ This folder contains two patch files for firefox to allow WebXR content to work 
 # How to compile
 In order to apply and compile this patch, it's important that you are able to compile Firefox yourself. For this follow the steps over at: https://firefox-source-docs.mozilla.org/setup/linux_build.html
 
-> **Note:** don't make use of 'Artiface Mode' as the patch modifies the C++ code
+> **Note:** don't make use of 'Artifact Mode' as the patch modifies the C++ code
 
 Once you have the Firefox code base locally, apply **one** of the two patch files. The following command is for the `webxr-linux-glx.patch` file (recommended):
 
@@ -23,6 +23,8 @@ Once applied, build using `./mach build` and if everything goes well, you should
 | `dom.webvr`     | true  |
 | `gfx.x11-egl.force-disabled` | true |
 > **Note:** when using the (slower) `webxr-linux.patch` instead of the `-glx` one, it's important to use EGL, so the `gfx.x11-egl.force-disabled` preference should be `false` (its default value).
+
+After configuring the above preferences, be sure to restart the firefox instance, since some of these only take affect on startup of Firefox.
 
 You are now ready to go and visit any WebXR experience on the web. Examples:
  * https://mixedreality.mozilla.org/hello-webxr/
