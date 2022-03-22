@@ -1,6 +1,8 @@
 # Firefox
 This folder contains two patch files for firefox to allow WebXR content to work under Linux. It is more a hack than a proper implementation, and is only tested under X11, using a Valve Index as HMD.
 
+![Firefox running 'Hello WebXR' under Linux with SteamVR](./screenshot.png)
+
 # How to compile
 In order to apply and compile this patch, it's important that you are able to compile Firefox yourself. For this follow the steps over at: https://firefox-source-docs.mozilla.org/setup/linux_build.html
 
