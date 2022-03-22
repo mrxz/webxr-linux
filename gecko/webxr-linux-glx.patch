@@ -1,0 +1,295 @@
+diff --git a/dom/canvas/WebGLContext.cpp b/dom/canvas/WebGLContext.cpp
+--- a/dom/canvas/WebGLContext.cpp
++++ b/dom/canvas/WebGLContext.cpp
+@@ -1031,6 +1031,11 @@ Maybe<layers::SurfaceDescriptor> WebGLCo
+   const auto& front = swapChain->FrontBuffer();
+   if (!front) return {};
+ 
++  // HACK: Only for WebVR do we want to return the surface descriptor.
++  // In all other cases, we want to old behaviour of returning Nothing.
++  if(!webvr) {
++    return Nothing();
++  }
+   return front->ToSurfaceDescriptor();
+ }
+ 
+diff --git a/gfx/gl/SharedSurfaceGL.cpp b/gfx/gl/SharedSurfaceGL.cpp
+--- a/gfx/gl/SharedSurfaceGL.cpp
++++ b/gfx/gl/SharedSurfaceGL.cpp
+@@ -29,7 +29,9 @@ SharedSurface_Basic::SharedSurface_Basic
+     : SharedSurface(desc, std::move(fb)) {}
+ 
+ Maybe<layers::SurfaceDescriptor> SharedSurface_Basic::ToSurfaceDescriptor() {
+-  return Nothing();
++  // Smuggle textureId and GLContext (as fence)
++  return Some(layers::SurfaceDescriptorSharedGLTexture(
++      mFb->ColorTex(), -1, (uintptr_t)mDesc.gl.get(), mFb->mSize, true));
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////
+diff --git a/gfx/vr/VRManager.cpp b/gfx/vr/VRManager.cpp
+--- a/gfx/vr/VRManager.cpp
++++ b/gfx/vr/VRManager.cpp
+@@ -1378,7 +1378,8 @@ bool VRManager::SubmitFrame(const layers
+   if (mState != VRManagerState::Active) {
+     return false;
+   }
+-#if defined(XP_WIN) || defined(XP_MACOSX) || defined(MOZ_WIDGET_ANDROID)
++#if defined(XP_WIN) || defined(XP_MACOSX) || defined(MOZ_WIDGET_ANDROID) || \
++    defined(XP_LINUX)
+   MOZ_ASSERT(mBrowserState.layerState[0].type ==
+              VRLayerType::LayerType_Stereo_Immersive);
+   VRLayer_Stereo_Immersive& layer =
+@@ -1426,6 +1427,17 @@ bool VRManager::SubmitFrame(const layers
+       layer.textureSize.width = desc.size().width;
+       layer.textureSize.height = desc.size().height;
+     } break;
++#  elif defined(XP_LINUX)
++    case SurfaceDescriptor::TSurfaceDescriptorSharedGLTexture: {
++      const SurfaceDescriptorSharedGLTexture& desc =
++          aTexture.get_SurfaceDescriptorSharedGLTexture();
++      layer.textureType = VRLayerTextureType::LayerTextureType_SharedGLTexture;
++      // HACK: Retrieve the pointer to the GLContext from the fence field.
++      layer.gl = (gl::GLContext*)desc.fence();
++      layer.textureHandle = (void*)desc.texture();
++      layer.textureSize.width = desc.size().width;
++      layer.textureSize.height = desc.size().height;
++    } break;
+ #  endif
+     default: {
+       MOZ_ASSERT(false);
+@@ -1488,7 +1500,7 @@ void VRManager::SubmitFrameInternal(cons
+     mCurrentSubmitTask = nullptr;
+   }
+ 
+-#if defined(XP_WIN) || defined(XP_MACOSX)
++#if defined(XP_WIN) || defined(XP_MACOSX) || defined(XP_LINUX)
+ 
+   /**
+    * Trigger the next VSync immediately after we are successfully
+diff --git a/gfx/vr/VRShMem.cpp b/gfx/vr/VRShMem.cpp
+--- a/gfx/vr/VRShMem.cpp
++++ b/gfx/vr/VRShMem.cpp
+@@ -247,12 +247,20 @@ void VRShMem::CreateShMemForAndroid() {
+ 
+ void VRShMem::ClearShMem() {
+   if (mExternalShmem != nullptr) {
++    // Note: If the generation is reset, the communication will fail.
++    // The other instance of VRShMem would still think to have read
++    // generation 1, meaning the first (important) update is ignored.
++    long generation = mExternalShmem->geckoGenerationA;
+ #ifdef MOZILLA_INTERNAL_API
+     // VRExternalShmem is asserted to be POD
+     mExternalShmem->Clear();
+ #else
+     memset((void*)mExternalShmem, 0, sizeof(VRExternalShmem));
+ #endif
++
++    // Continue counting generations where we left off.
++    mExternalShmem->geckoGenerationA = mExternalShmem->geckoGenerationB =
++        generation + 1;
+   }
+ }
+ 
+diff --git a/gfx/vr/external_api/moz_external_vr.h b/gfx/vr/external_api/moz_external_vr.h
+--- a/gfx/vr/external_api/moz_external_vr.h
++++ b/gfx/vr/external_api/moz_external_vr.h
+@@ -451,7 +451,8 @@ enum class VRLayerTextureType : uint16_t
+   LayerTextureType_None = 0,
+   LayerTextureType_D3D10SurfaceDescriptor = 1,
+   LayerTextureType_MacIOSurface = 2,
+-  LayerTextureType_GeckoSurfaceTexture = 3
++  LayerTextureType_GeckoSurfaceTexture = 3,
++  LayerTextureType_SharedGLTexture = 4
+ };
+ 
+ struct VRLayer_2D_Content {
+@@ -468,6 +469,7 @@ struct VRLayer_Stereo_Immersive {
+   VRLayerEyeRect leftEyeRect;
+   VRLayerEyeRect rightEyeRect;
+   IntSize_POD textureSize;
++  void* gl;
+ };
+ 
+ struct VRLayerState {
+diff --git a/gfx/vr/service/OSVRSession.cpp b/gfx/vr/service/OSVRSession.cpp
+--- a/gfx/vr/service/OSVRSession.cpp
++++ b/gfx/vr/service/OSVRSession.cpp
+@@ -497,7 +497,7 @@ bool OSVRSession::SubmitFrame(
+   return false;
+   // TODO Implement
+ }
+-#elif defined(XP_MACOSX)
++#elif defined(XP_MACOSX) || defined(XP_LINUX)
+ bool OSVRSession::SubmitFrame(
+     const mozilla::gfx::VRLayer_Stereo_Immersive& aLayer,
+     const VRLayerTextureHandle& aTexture) {
+diff --git a/gfx/vr/service/OSVRSession.h b/gfx/vr/service/OSVRSession.h
+--- a/gfx/vr/service/OSVRSession.h
++++ b/gfx/vr/service/OSVRSession.h
+@@ -44,7 +44,7 @@ class OSVRSession : public VRSession {
+ #if defined(XP_WIN)
+   bool SubmitFrame(const mozilla::gfx::VRLayer_Stereo_Immersive& aLayer,
+                    ID3D11Texture2D* aTexture) override;
+-#elif defined(XP_MACOSX)
++#elif defined(XP_MACOSX) || defined(XP_LINUX)
+   bool SubmitFrame(const mozilla::gfx::VRLayer_Stereo_Immersive& aLayer,
+                    const VRLayerTextureHandle& aTexture) override;
+ #endif
+diff --git a/gfx/vr/service/OpenVRSession.cpp b/gfx/vr/service/OpenVRSession.cpp
+--- a/gfx/vr/service/OpenVRSession.cpp
++++ b/gfx/vr/service/OpenVRSession.cpp
+@@ -18,6 +18,8 @@
+ #  include "mozilla/gfx/DeviceManagerDx.h"
+ #elif defined(XP_MACOSX)
+ #  include "mozilla/gfx/MacIOSurface.h"
++#elif defined(XP_LINUX)
++#  include "GLContextProvider.h"
+ #endif
+ 
+ #if !defined(XP_WIN)
+@@ -1284,6 +1286,14 @@ bool OpenVRSession::SubmitFrame(
+   return SubmitFrame(aTexture, ::vr::ETextureType::TextureType_IOSurface,
+                      aLayer.leftEyeRect, aLayer.rightEyeRect);
+ }
++#elif defined(XP_LINUX)
++bool OpenVRSession::SubmitFrame(
++    const mozilla::gfx::VRLayer_Stereo_Immersive& aLayer,
++    const VRLayerTextureHandle& aTexture) {
++  mGLContext = (gl::GLContext*)aLayer.gl;
++  return SubmitFrame(aTexture, ::vr::ETextureType::TextureType_OpenGL,
++                     aLayer.leftEyeRect, aLayer.rightEyeRect);
++}
+ #endif
+ 
+ bool OpenVRSession::SubmitFrame(const VRLayerTextureHandle& aTextureHandle,
+@@ -1303,32 +1313,33 @@ bool OpenVRSession::SubmitFrame(const VR
+ 
+   CFTypeRefPtr<IOSurfaceRef> ioSurface = surf->GetIOSurfaceRef();
+   tex.handle = (void*)ioSurface.get();
+-#else
++#endif
++  tex.eColorSpace = ::vr::EColorSpace::ColorSpace_Gamma;
++  tex.eType = aTextureType;
++
++  mGLContext->MakeCurrent(true);
+   tex.handle = aTextureHandle;
+-#endif
+-  tex.eType = aTextureType;
+-  tex.eColorSpace = ::vr::EColorSpace::ColorSpace_Auto;
+ 
+   ::vr::VRTextureBounds_t bounds;
+   bounds.uMin = aLeftEyeRect.x;
+-  bounds.vMin = 1.0 - aLeftEyeRect.y;
++  bounds.vMin = 1.0 - (aLeftEyeRect.y + aLeftEyeRect.height);
+   bounds.uMax = aLeftEyeRect.x + aLeftEyeRect.width;
+-  bounds.vMax = 1.0 - (aLeftEyeRect.y + aLeftEyeRect.height);
++  bounds.vMax = 1.0 - aLeftEyeRect.y;
+ 
+   ::vr::EVRCompositorError err;
+   err = mVRCompositor->Submit(::vr::EVREye::Eye_Left, &tex, &bounds);
+   if (err != ::vr::EVRCompositorError::VRCompositorError_None) {
+-    printf_stderr("OpenVR Compositor Submit() failed.\n");
++    printf_stderr("OpenVR Compositor Submit() failed: err=%d.\n", err);
+   }
+ 
+   bounds.uMin = aRightEyeRect.x;
+-  bounds.vMin = 1.0 - aRightEyeRect.y;
++  bounds.vMin = 1.0 - (aRightEyeRect.y + aRightEyeRect.height);
+   bounds.uMax = aRightEyeRect.x + aRightEyeRect.width;
+-  bounds.vMax = 1.0 - (aRightEyeRect.y + aRightEyeRect.height);
++  bounds.vMax = 1.0 - aRightEyeRect.y;
+ 
+   err = mVRCompositor->Submit(::vr::EVREye::Eye_Right, &tex, &bounds);
+   if (err != ::vr::EVRCompositorError::VRCompositorError_None) {
+-    printf_stderr("OpenVR Compositor Submit() failed.\n");
++    printf_stderr("OpenVR Compositor Submit() failed: err=%d\n", err);
+   }
+ 
+   mVRCompositor->PostPresentHandoff();
+diff --git a/gfx/vr/service/OpenVRSession.h b/gfx/vr/service/OpenVRSession.h
+--- a/gfx/vr/service/OpenVRSession.h
++++ b/gfx/vr/service/OpenVRSession.h
+@@ -16,6 +16,8 @@
+ 
+ #if defined(XP_WIN)
+ #  include <d3d11_1.h>
++#elif defined(XP_LINUX)
++#  include "GLContext.h"
+ #endif
+ class nsITimer;
+ 
+@@ -58,6 +60,9 @@ class OpenVRSession : public VRSession {
+ #elif defined(XP_MACOSX)
+   bool SubmitFrame(const mozilla::gfx::VRLayer_Stereo_Immersive& aLayer,
+                    const VRLayerTextureHandle& aTexture) override;
++#elif defined(XP_LINUX)
++  bool SubmitFrame(const mozilla::gfx::VRLayer_Stereo_Immersive& aLayer,
++                   const VRLayerTextureHandle& aTexture) override;
+ #endif
+ 
+  private:
+@@ -73,6 +78,10 @@ class OpenVRSession : public VRSession {
+   bool mIsWindowsMR;
+   TimeStamp mLastHapticUpdate;
+ 
++#if defined(XP_LINUX)
++  RefPtr<gl::GLContext> mGLContext;
++#endif
++
+   static void HapticTimerCallback(nsITimer* aTimer, void* aClosure);
+   bool InitState(mozilla::gfx::VRSystemState& aSystemState);
+   void UpdateStageParameters(mozilla::gfx::VRDisplayState& aState);
+diff --git a/gfx/vr/service/PuppetSession.cpp b/gfx/vr/service/PuppetSession.cpp
+--- a/gfx/vr/service/PuppetSession.cpp
++++ b/gfx/vr/service/PuppetSession.cpp
+@@ -89,7 +89,7 @@ bool PuppetSession::SubmitFrame(
+     ID3D11Texture2D* aTexture) {
+   return VRPuppetCommandBuffer::Get().SubmitFrame();
+ }
+-#elif defined(XP_MACOSX)
++#elif defined(XP_MACOSX) || defined(XP_LINUX)
+ bool PuppetSession::SubmitFrame(
+     const mozilla::gfx::VRLayer_Stereo_Immersive& aLayer,
+     const VRLayerTextureHandle& aTexture) {
+diff --git a/gfx/vr/service/PuppetSession.h b/gfx/vr/service/PuppetSession.h
+--- a/gfx/vr/service/PuppetSession.h
++++ b/gfx/vr/service/PuppetSession.h
+@@ -41,7 +41,7 @@ class PuppetSession : public VRSession {
+ #if defined(XP_WIN)
+   bool SubmitFrame(const mozilla::gfx::VRLayer_Stereo_Immersive& aLayer,
+                    ID3D11Texture2D* aTexture) override;
+-#elif defined(XP_MACOSX)
++#elif defined(XP_MACOSX) || defined(XP_LINUX)
+   bool SubmitFrame(const mozilla::gfx::VRLayer_Stereo_Immersive& aLayer,
+                    const VRLayerTextureHandle& aTexture) override;
+ #endif
+diff --git a/gfx/vr/service/VRSession.cpp b/gfx/vr/service/VRSession.cpp
+--- a/gfx/vr/service/VRSession.cpp
++++ b/gfx/vr/service/VRSession.cpp
+@@ -148,6 +148,13 @@ bool VRSession::SubmitFrame(
+     return SubmitFrame(aLayer, aLayer.textureHandle);
+   }
+ 
++#elif defined(XP_LINUX)
++
++  if (aLayer.textureType ==
++      VRLayerTextureType::LayerTextureType_SharedGLTexture) {
++    return SubmitFrame(aLayer, aLayer.textureHandle);
++  }
++
+ #endif
+ 
+   return false;
+diff --git a/gfx/vr/service/VRSession.h b/gfx/vr/service/VRSession.h
+--- a/gfx/vr/service/VRSession.h
++++ b/gfx/vr/service/VRSession.h
+@@ -80,7 +80,7 @@ class VRSession {
+   ID3D11DeviceContext1* mContext;
+   ID3DDeviceContextState* mDeviceContextState;
+ 
+-#elif defined(XP_MACOSX)
++#elif defined(XP_MACOSX) || defined(XP_LINUX)
+   virtual bool SubmitFrame(const mozilla::gfx::VRLayer_Stereo_Immersive& aLayer,
+                            const VRLayerTextureHandle& aTexture) = 0;
+ #endif
