@@ -1,0 +1,594 @@
+From 0a5101b549cc9e38c032d5fa830b3c376d651d79 Mon Sep 17 00:00:00 2001
+From: Noeri Huisman <mrxz@users.noreply.github.com>
+Date: Tue, 16 Aug 2022 21:06:05 +0200
+Subject: [PATCH 1/6] WIP getting it to compile
+
+---
+ DEPS                                        |  2 +-
+ device/vr/buildflags/buildflags.gni         |  2 +-
+ device/vr/openxr/openxr_anchor_manager.cc   |  4 +-
+ device/vr/openxr/openxr_api_wrapper.cc      | 52 ++++++++++++++++++++-
+ device/vr/openxr/openxr_api_wrapper.h       | 25 ++++++++--
+ device/vr/openxr/openxr_controller.cc       | 35 +++++---------
+ device/vr/openxr/openxr_extension_helper.cc | 11 +++++
+ device/vr/openxr/openxr_extension_helper.h  | 15 ++++++
+ device/vr/openxr/openxr_statics.h           |  2 +
+ device/vr/openxr/openxr_util.cc             | 21 +++++----
+ device/vr/openxr/openxr_util.h              |  8 ++++
+ third_party/openxr/BUILD.gn                 | 10 ++++
+ 12 files changed, 145 insertions(+), 42 deletions(-)
+
+diff --git a/DEPS b/DEPS
+index 6a29daccea0dc..2b0f5d729e8a6 100644
+--- a/DEPS
++++ b/DEPS
+@@ -160,7 +160,7 @@ vars = {
+   # By default checkout the OpenXR loader library only on Windows. The OpenXR
+   # backend for VR in Chromium is currently only supported for Windows, but
+   # support for other platforms may be added in the future.
+-  'checkout_openxr' : 'checkout_win',
++  'checkout_openxr' : True,
+ 
+   'checkout_traffic_annotation_tools': 'checkout_configuration != "small"',
+   'checkout_instrumented_libraries': 'checkout_linux and checkout_configuration != "small"',
+diff --git a/device/vr/buildflags/buildflags.gni b/device/vr/buildflags/buildflags.gni
+index aec58716cf52c..45551b24318c9 100644
+--- a/device/vr/buildflags/buildflags.gni
++++ b/device/vr/buildflags/buildflags.gni
+@@ -15,7 +15,7 @@ declare_args() {
+ 
+   # To build with OpenXR support, the OpenXR Loader needs to be pulled to
+   # third_party/openxr.
+-  enable_openxr = checkout_openxr && is_win
++  enable_openxr = ( is_win || is_linux )
+ }
+ 
+ declare_args() {
+diff --git a/device/vr/openxr/openxr_anchor_manager.cc b/device/vr/openxr/openxr_anchor_manager.cc
+index 6989b0dbc427c..42a08d5e8e8d6 100644
+--- a/device/vr/openxr/openxr_anchor_manager.cc
++++ b/device/vr/openxr/openxr_anchor_manager.cc
+@@ -114,7 +114,7 @@ AnchorId OpenXrAnchorManager::CreateAnchor(XrPosef pose,
+       XR_TYPE_SPATIAL_ANCHOR_SPACE_CREATE_INFO_MSFT};
+   space_create_info.anchor = xr_anchor;
+   space_create_info.poseInAnchorSpace = PoseIdentity();
+-  if (FAILED(
++  if (XR_FAILED(
+           extension_helper_.ExtensionMethods().xrCreateSpatialAnchorSpaceMSFT(
+               session_, &space_create_info, &anchor_space))) {
+     std::ignore =
+@@ -168,7 +168,7 @@ mojom::XRAnchorsDataPtr OpenXrAnchorManager::GetCurrentAnchorsData(
+     all_anchors_ids[index] = anchor_id.GetUnsafeValue();
+ 
+     XrSpaceLocation anchor_from_mojo = {XR_TYPE_SPACE_LOCATION};
+-    if (FAILED(xrLocateSpace(anchor_space, mojo_space_, predicted_display_time,
++    if (XR_FAILED(xrLocateSpace(anchor_space, mojo_space_, predicted_display_time,
+                              &anchor_from_mojo)) ||
+         !IsPoseValid(anchor_from_mojo.locationFlags)) {
+       updated_anchors[index] =
+diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
+index a9d147c1d92a8..49d918b78fa4c 100644
+--- a/device/vr/openxr/openxr_api_wrapper.cc
++++ b/device/vr/openxr/openxr_api_wrapper.cc
+@@ -4,7 +4,11 @@
+ 
+ #include "device/vr/openxr/openxr_api_wrapper.h"
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+ #include <dxgi1_2.h>
++#include "gpu/ipc/common/gpu_memory_buffer_impl_dxgi.h"
++#endif
++
+ #include <stdint.h>
+ #include <algorithm>
+ #include <array>
+@@ -22,7 +26,6 @@
+ #include "gpu/GLES2/gl2extchromium.h"
+ #include "gpu/command_buffer/client/shared_image_interface.h"
+ #include "gpu/command_buffer/common/shared_image_usage.h"
+-#include "gpu/ipc/common/gpu_memory_buffer_impl_dxgi.h"
+ #include "ui/gfx/geometry/angle_conversions.h"
+ #include "ui/gfx/geometry/point3_f.h"
+ #include "ui/gfx/geometry/quaternion.h"
+@@ -94,8 +97,10 @@ std::unique_ptr<OpenXrApiWrapper> OpenXrApiWrapper::Create(
+   return openxr;
+ }
+ 
++#ifdef XR_USE_PLATFORM_WIN32
+ OpenXrApiWrapper::SwapChainInfo::SwapChainInfo(ID3D11Texture2D* d3d11_texture)
+     : d3d11_texture(d3d11_texture) {}
++#endif
+ OpenXrApiWrapper::SwapChainInfo::~SwapChainInfo() {
+   // If shared images are being used, the mailbox holder should have been
+   // cleared before destruction, either due to the context provider being lost
+@@ -400,12 +405,16 @@ OpenXrApiWrapper::GetOrCreateSceneUnderstandingManager(
+ // objects that may have been created before the failure.
+ XrResult OpenXrApiWrapper::InitSession(
+     const std::unordered_set<mojom::XRSessionFeature>& enabled_features,
++#ifdef XR_USE_GRAPHICS_API_D3D11
+     const Microsoft::WRL::ComPtr<ID3D11Device>& d3d_device,
++#endif
+     const OpenXrExtensionHelper& extension_helper,
+     SessionStartedCallback on_session_started_callback,
+     SessionEndedCallback on_session_ended_callback,
+     VisibilityChangedCallback visibility_changed_callback) {
++#ifdef XR_USE_GRAPHICS_API_D3D11
+   DCHECK(d3d_device.Get());
++#endif
+   DCHECK(IsInitialized());
+ 
+   enabled_features_ = enabled_features;
+@@ -423,7 +432,11 @@ XrResult OpenXrApiWrapper::InitSession(
+   on_session_ended_callback_ = std::move(on_session_ended_callback);
+   visibility_changed_callback_ = std::move(visibility_changed_callback);
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+   RETURN_IF_XR_FAILED(CreateSession(d3d_device));
++#else
++  RETURN_IF_XR_FAILED(CreateSession());
++#endif
+   RETURN_IF_XR_FAILED(CreateSwapchain());
+   RETURN_IF_XR_FAILED(
+       CreateSpace(XR_REFERENCE_SPACE_TYPE_LOCAL, &local_space_));
+@@ -456,6 +469,7 @@ XrResult OpenXrApiWrapper::InitSession(
+   return XR_SUCCESS;
+ }
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+ XrResult OpenXrApiWrapper::CreateSession(
+     const Microsoft::WRL::ComPtr<ID3D11Device>& d3d_device) {
+   DCHECK(d3d_device.Get());
+@@ -472,6 +486,25 @@ XrResult OpenXrApiWrapper::CreateSession(
+ 
+   return xrCreateSession(instance_, &session_create_info, &session_);
+ }
++#endif
++
++#ifdef XR_USE_GRAPHICS_API_OPENGL
++XrResult OpenXrApiWrapper::CreateSession() {
++  DCHECK(!HasSession());
++  DCHECK(IsInitialized());
++
++  XrGraphicsBindingOpenGLXlibKHR gl_binding = {
++      XR_TYPE_GRAPHICS_BINDING_OPENGL_XLIB_KHR};
++  // TODO: fill gl_binding properties
++
++
++  XrSessionCreateInfo session_create_info = {XR_TYPE_SESSION_CREATE_INFO};
++  session_create_info.next = &gl_binding;
++  session_create_info.systemId = system_;
++
++  return xrCreateSession(instance_, &session_create_info, &session_);
++}
++#endif
+ 
+ XrResult OpenXrApiWrapper::CreateSwapchain() {
+   DCHECK(IsInitialized());
+@@ -481,6 +514,8 @@ XrResult OpenXrApiWrapper::CreateSwapchain() {
+ 
+   XrSwapchainCreateInfo swapchain_create_info = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+   swapchain_create_info.arraySize = 1;
++
++#ifdef XR_USE_GRAPHICS_API_D3D11
+   // OpenXR's swapchain format expects to describe the texture content.
+   // The result of a swapchain image created from OpenXR API always contains a
+   // typeless texture. On the other hand, WebGL API uses CSS color convention
+@@ -496,6 +531,7 @@ XrResult OpenXrApiWrapper::CreateSwapchain() {
+   swapchain_create_info.faceCount = 1;
+   swapchain_create_info.sampleCount = GetRecommendedSwapchainSampleCount();
+   swapchain_create_info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
++#endif
+ 
+   XrSwapchain color_swapchain;
+   RETURN_IF_XR_FAILED(
+@@ -505,8 +541,14 @@ XrResult OpenXrApiWrapper::CreateSwapchain() {
+   RETURN_IF_XR_FAILED(
+       xrEnumerateSwapchainImages(color_swapchain, 0, &chain_length, nullptr));
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+   std::vector<XrSwapchainImageD3D11KHR> color_swapchain_images(
+       chain_length, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
++#endif
++#ifdef XR_USE_GRAPHICS_API_OPENGL
++  std::vector<XrSwapchainImageOpenGLKHR> color_swapchain_images(
++      chain_length, {XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR});
++#endif
+ 
+   RETURN_IF_XR_FAILED(xrEnumerateSwapchainImages(
+       color_swapchain, color_swapchain_images.size(), &chain_length,
+@@ -661,6 +703,7 @@ void OpenXrApiWrapper::ReleaseColorSwapchainImages() {
+   color_swapchain_images_.clear();
+ }
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+ void OpenXrApiWrapper::CreateSharedMailboxes() {
+   if (!context_provider_ || !ShouldCreateSharedImages()) {
+     return;
+@@ -730,12 +773,14 @@ void OpenXrApiWrapper::CreateSharedMailboxes() {
+     mailbox_holder.texture_target = GL_TEXTURE_2D;
+   }
+ }
++#endif
+ 
+ bool OpenXrApiWrapper::IsUsingSharedImages() const {
+   return ((color_swapchain_images_.size() > 1) &&
+           !color_swapchain_images_[0].mailbox_holder.mailbox.IsZero());
+ }
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+ void OpenXrApiWrapper::StoreFence(
+     Microsoft::WRL::ComPtr<ID3D11Fence> d3d11_fence,
+     int16_t frame_index) {
+@@ -745,6 +790,7 @@ void OpenXrApiWrapper::StoreFence(
+         std::move(d3d11_fence);
+   }
+ }
++#endif
+ 
+ XrResult OpenXrApiWrapper::CreateSpace(XrReferenceSpaceType type,
+                                        XrSpace* space) {
+@@ -791,6 +837,7 @@ XrResult OpenXrApiWrapper::BeginSession() {
+   return xr_result;
+ }
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+ XrResult OpenXrApiWrapper::BeginFrame(
+     Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture,
+     gpu::MailboxHolder& mailbox_holder) {
+@@ -851,6 +898,7 @@ XrResult OpenXrApiWrapper::BeginFrame(
+ 
+   return XR_SUCCESS;
+ }
++#endif
+ 
+ XrResult OpenXrApiWrapper::UpdateViewConfigurations() {
+   // While secondary views are only active when reported by the OpenXR runtime,
+@@ -975,6 +1023,7 @@ XrResult OpenXrApiWrapper::PrepareViewConfigForRender(
+   return XR_SUCCESS;
+ }
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+ XrResult OpenXrApiWrapper::EndFrame() {
+   DCHECK(pending_frame_);
+   DCHECK(HasBlendMode());
+@@ -1027,6 +1076,7 @@ XrResult OpenXrApiWrapper::EndFrame() {
+ 
+   return XR_SUCCESS;
+ }
++#endif
+ 
+ bool OpenXrApiWrapper::HasPendingFrame() const {
+   return pending_frame_;
+diff --git a/device/vr/openxr/openxr_api_wrapper.h b/device/vr/openxr/openxr_api_wrapper.h
+index be98948c400a7..d1269c56d9f7a 100644
+--- a/device/vr/openxr/openxr_api_wrapper.h
++++ b/device/vr/openxr/openxr_api_wrapper.h
+@@ -5,9 +5,12 @@
+ #ifndef DEVICE_VR_OPENXR_OPENXR_API_WRAPPER_H_
+ #define DEVICE_VR_OPENXR_OPENXR_API_WRAPPER_H_
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+ #include <d3d11_4.h>
+-#include <stdint.h>
+ #include <wrl.h>
++#endif
++
++#include <stdint.h>
+ #include <memory>
+ #include <vector>
+ 
+@@ -62,7 +65,9 @@ class OpenXrApiWrapper {
+ 
+   XrResult InitSession(
+       const std::unordered_set<mojom::XRSessionFeature>& enabled_features,
++#ifdef XR_USE_GRAPHICS_API_D3D11
+       const Microsoft::WRL::ComPtr<ID3D11Device>& d3d_device,
++#endif
+       const OpenXrExtensionHelper& extension_helper,
+       SessionStartedCallback on_session_started_callback,
+       SessionEndedCallback on_session_ended_callback,
+@@ -70,9 +75,12 @@ class OpenXrApiWrapper {
+ 
+   XrSpace GetReferenceSpace(device::mojom::XRReferenceSpaceType type) const;
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+   XrResult BeginFrame(Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture,
+                       gpu::MailboxHolder& mailbox_holder);
+   XrResult EndFrame();
++#endif
++
+   bool HasPendingFrame() const;
+   bool HasFrameState() const;
+ 
+@@ -84,8 +92,10 @@ class OpenXrApiWrapper {
+   std::vector<mojom::XRViewPtr> GetDefaultViews() const;
+   gfx::Size GetSwapchainSize() const;
+   XrTime GetPredictedDisplayTime() const;
++#ifdef XR_USE_GRAPHICS_API_D3D11
+   XrResult GetLuid(const OpenXrExtensionHelper& extension_helper,
+                    LUID& luid) const;
++#endif
+   bool GetStageParameters(XrExtent2Df& stage_bounds,
+                           gfx::Transform& local_from_stage);
+   bool StageParametersEnabled() const;
+@@ -106,8 +116,10 @@ class OpenXrApiWrapper {
+   bool IsUsingSharedImages() const;
+ 
+   static void DEVICE_VR_EXPORT SetTestHook(VRTestHook* hook);
++#ifdef XR_USE_GRAPHICS_API_D3D11
+   void StoreFence(Microsoft::WRL::ComPtr<ID3D11Fence> d3d11_fence,
+                   int16_t frame_index);
++#endif
+ 
+  private:
+   void Reset();
+@@ -125,7 +137,10 @@ class OpenXrApiWrapper {
+   void EnsureEventPolling();
+ 
+   XrResult CreateSession(
+-      const Microsoft::WRL::ComPtr<ID3D11Device>& d3d_device);
++#ifdef XR_USE_GRAPHICS_API_D3D11
++      const Microsoft::WRL::ComPtr<ID3D11Device>& d3d_device
++#endif
++  );
+   XrResult CreateSwapchain();
+   bool RecomputeSwapchainSizeAndViewports();
+   XrResult CreateSpace(XrReferenceSpaceType type, XrSpace* space);
+@@ -196,15 +211,19 @@ class OpenXrApiWrapper {
+   // When shared images are being used, there is a corresponding MailboxHolder
+   // and D3D11Fence for each D3D11 texture in the vector.
+   struct SwapChainInfo {
++#ifdef XR_USE_GRAPHICS_API_D3D11
+     explicit SwapChainInfo(ID3D11Texture2D*);
++#endif
+     ~SwapChainInfo();
+     SwapChainInfo(SwapChainInfo&&);
+ 
+     void Clear();
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+     raw_ptr<ID3D11Texture2D> d3d11_texture = nullptr;
+-    gpu::MailboxHolder mailbox_holder;
+     Microsoft::WRL::ComPtr<ID3D11Fence> d3d11_fence;
++#endif
++    gpu::MailboxHolder mailbox_holder;
+   };
+ 
+   // The swapchain is initializd when a session begins and is re-created when
+diff --git a/device/vr/openxr/openxr_controller.cc b/device/vr/openxr/openxr_controller.cc
+index 32b170aa55019..ee35b2413292d 100644
+--- a/device/vr/openxr/openxr_controller.cc
++++ b/device/vr/openxr/openxr_controller.cc
+@@ -4,7 +4,11 @@
+ 
+ #include "device/vr/openxr/openxr_controller.h"
+ 
++#include <stdio.h>
++#include <stdlib.h>
+ #include <stdint.h>
++#include <string.h>
++#include <cstring>
+ 
+ #include "base/check.h"
+ #include "base/notreached.h"
+@@ -178,24 +182,13 @@ XrResult OpenXrController::Initialize(
+   path_helper_ = path_helper;
+   extension_helper_ = &extension_helper;
+ 
+-  std::string action_set_name =
+-      std::string(GetStringFromType(type_)) + "_action_set";
++  std::string action_set_name = std::string(GetStringFromType(type_)) + "_action_set";
+ 
+-  XrActionSetCreateInfo action_set_create_info = {
+-      XR_TYPE_ACTION_SET_CREATE_INFO};
+-
+-  errno_t error = strcpy_s(action_set_create_info.actionSetName,
+-                           std::size(action_set_create_info.actionSetName),
+-                           action_set_name.c_str());
+-  DCHECK(!error);
+-  error = strcpy_s(action_set_create_info.localizedActionSetName,
+-                   std::size(action_set_create_info.localizedActionSetName),
+-                   action_set_name.c_str());
+-  DCHECK(!error);
+-
+-  RETURN_IF_XR_FAILED(
+-      xrCreateActionSet(instance_, &action_set_create_info, &action_set_));
++  XrActionSetCreateInfo action_set_create_info = {XR_TYPE_ACTION_SET_CREATE_INFO};
+ 
++  strcpy(action_set_create_info.actionSetName, action_set_name.c_str());
++  strcpy(action_set_create_info.localizedActionSetName, action_set_name.c_str());
++  RETURN_IF_XR_FAILED(xrCreateActionSet(instance_, &action_set_create_info, &action_set_));
+   RETURN_IF_XR_FAILED(InitializeControllerActions());
+ 
+   SuggestBindings(bindings);
+@@ -619,14 +612,8 @@ XrResult OpenXrController::CreateAction(XrActionType type,
+   XrActionCreateInfo action_create_info = {XR_TYPE_ACTION_CREATE_INFO};
+   action_create_info.actionType = type;
+ 
+-  errno_t error =
+-      strcpy_s(action_create_info.actionName,
+-               std::size(action_create_info.actionName), action_name.data());
+-  DCHECK(error == 0);
+-  error = strcpy_s(action_create_info.localizedActionName,
+-                   std::size(action_create_info.localizedActionName),
+-                   action_name.data());
+-  DCHECK(error == 0);
++  strcpy(action_create_info.actionName, action_name.data());
++  strcpy(action_create_info.localizedActionName, action_name.data());
+   return xrCreateAction(action_set_, &action_create_info, action);
+ }
+ 
+diff --git a/device/vr/openxr/openxr_extension_helper.cc b/device/vr/openxr/openxr_extension_helper.cc
+index 124592147d6b1..63aa3effe794e 100644
+--- a/device/vr/openxr/openxr_extension_helper.cc
++++ b/device/vr/openxr/openxr_extension_helper.cc
+@@ -43,11 +43,22 @@ OpenXrExtensionHelper::OpenXrExtensionHelper(
+   // Failure to query a method results in a nullptr
+ 
+   // D3D11
++  #ifdef XR_USE_GRAPHICS_API_D3D11
+   std::ignore = xrGetInstanceProcAddr(
+       instance, "xrGetD3D11GraphicsRequirementsKHR",
+       reinterpret_cast<PFN_xrVoidFunction*>(
+           const_cast<PFN_xrGetD3D11GraphicsRequirementsKHR*>(
+               &extension_methods_.xrGetD3D11GraphicsRequirementsKHR)));
++  #endif
++
++  // OpenGL
++  #ifdef XR_USE_GRAPHICS_API_OPENGL
++  std::ignore = xrGetInstanceProcAddr(
++      instance, "xrGetOpenGLGraphicsRequirementsKHR",
++      reinterpret_cast<PFN_xrVoidFunction*>(
++          const_cast<PFN_xrGetOpenGLGraphicsRequirementsKHR*>(
++              &extension_methods_.xrGetOpenGLGraphicsRequirementsKHR)));
++  #endif
+ 
+   // Hand tracking methods
+   std::ignore = xrGetInstanceProcAddr(
+diff --git a/device/vr/openxr/openxr_extension_helper.h b/device/vr/openxr/openxr_extension_helper.h
+index 5091352935b08..c7673c01340cd 100644
+--- a/device/vr/openxr/openxr_extension_helper.h
++++ b/device/vr/openxr/openxr_extension_helper.h
+@@ -5,7 +5,16 @@
+ #ifndef DEVICE_VR_OPENXR_OPENXR_EXTENSION_HELPER_H_
+ #define DEVICE_VR_OPENXR_OPENXR_EXTENSION_HELPER_H_
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+ #include <d3d11.h>
++#endif
++
++#ifdef XR_USE_GRAPHICS_API_OPENGL
++#if defined(XR_USE_PLATFORM_XLIB) || defined(XR_USE_PLATFORM_XCB)
++#include <GL/glx.h>
++#endif  // (XR_USE_PLATFORM_XLIB || XR_USE_PLATFORM_XCB)
++#endif
++
+ #include <vector>
+ 
+ #include "base/logging.h"
+@@ -18,8 +27,14 @@ struct OpenXrExtensionMethods {
+   OpenXrExtensionMethods();
+   ~OpenXrExtensionMethods();
+   // D3D
++  #ifdef XR_USE_GRAPHICS_API_D3D11
+   PFN_xrGetD3D11GraphicsRequirementsKHR xrGetD3D11GraphicsRequirementsKHR{
+       nullptr};
++  #endif
++  #ifdef XR_USE_GRAPHICS_API_OPENGL
++  PFN_xrGetOpenGLGraphicsRequirementsKHR xrGetOpenGLGraphicsRequirementsKHR{
++      nullptr};
++  #endif
+ 
+   // Hand Tracking
+   PFN_xrCreateHandTrackerEXT xrCreateHandTrackerEXT{nullptr};
+diff --git a/device/vr/openxr/openxr_statics.h b/device/vr/openxr/openxr_statics.h
+index ee789c4b1e4b4..f4a71ec61152e 100644
+--- a/device/vr/openxr/openxr_statics.h
++++ b/device/vr/openxr/openxr_statics.h
+@@ -5,7 +5,9 @@
+ #ifndef DEVICE_VR_OPENXR_OPENXR_STATICS_H_
+ #define DEVICE_VR_OPENXR_OPENXR_STATICS_H_
+ 
++#ifdef XR_USE_GRAPHICS_API_D3D11
+ #include <d3d11.h>
++#endif
+ 
+ #include "base/memory/singleton.h"
+ #include "build/build_config.h"
+diff --git a/device/vr/openxr/openxr_util.cc b/device/vr/openxr/openxr_util.cc
+index f8987de31eb84..6da87b9935940 100644
+--- a/device/vr/openxr/openxr_util.cc
++++ b/device/vr/openxr/openxr_util.cc
+@@ -8,7 +8,9 @@
+ 
+ #include "base/check_op.h"
+ #include "base/version.h"
++#if BUILDFLAG(IS_WIN)
+ #include "base/win/scoped_handle.h"
++#endif
+ #include "build/build_config.h"
+ #include "components/version_info/version_info.h"
+ #include "ui/gfx/geometry/angle_conversions.h"
+@@ -94,11 +96,7 @@ XrResult CreateInstance(
+ 
+   std::string application_name = version_info::GetProductName() + " " +
+                                  version_info::GetMajorVersionNumber();
+-  errno_t error =
+-      strcpy_s(instance_create_info.applicationInfo.applicationName,
+-               std::size(instance_create_info.applicationInfo.applicationName),
+-               application_name.c_str());
+-  DCHECK_EQ(error, 0);
++  strcpy(instance_create_info.applicationInfo.applicationName, application_name.c_str());
+ 
+   base::Version version = version_info::GetVersion();
+   DCHECK_EQ(version.components().size(), 4uLL);
+@@ -107,10 +105,7 @@ XrResult CreateInstance(
+   // application version will be the build number of each vendor
+   instance_create_info.applicationInfo.applicationVersion = build;
+ 
+-  error = strcpy_s(instance_create_info.applicationInfo.engineName,
+-                   std::size(instance_create_info.applicationInfo.engineName),
+-                   "Chromium");
+-  DCHECK_EQ(error, 0);
++  strcpy(instance_create_info.applicationInfo.engineName, "Chromium");
+ 
+   // engine version should be the build number of chromium
+   instance_create_info.applicationInfo.engineVersion = build;
+@@ -123,7 +118,13 @@ XrResult CreateInstance(
+   // to validate these extensions.
+   // Since the OpenXR backend only knows how to draw with D3D11 at the moment,
+   // the XR_KHR_D3D11_ENABLE_EXTENSION_NAME is required.
+-  std::vector<const char*> extensions{XR_KHR_D3D11_ENABLE_EXTENSION_NAME};
++  std::vector<const char*> extensions;
++#ifdef XR_USE_GRAPHICS_API_D3D11
++  extensions.push_back(XR_KHR_D3D11_ENABLE_EXTENSION_NAME);
++#endif
++#ifdef XR_USE_GRAPHICS_API_OPENGL
++  extensions.push_back(XR_KHR_OPENGL_ENABLE_EXTENSION_NAME);
++#endif
+ 
+   // If we are in an app container, we must require the app container extension
+   // to ensure robust execution of the OpenXR runtime
+diff --git a/device/vr/openxr/openxr_util.h b/device/vr/openxr/openxr_util.h
+index 6f315de4eb2ae..c695ba4e67cab 100644
+--- a/device/vr/openxr/openxr_util.h
++++ b/device/vr/openxr/openxr_util.h
+@@ -5,7 +5,15 @@
+ #ifndef DEVICE_VR_OPENXR_OPENXR_UTIL_H_
+ #define DEVICE_VR_OPENXR_OPENXR_UTIL_H_
+ 
++#ifdef XR_USE_PLATFORM_WIN32
+ #include <d3d11.h>
++#endif
++
++#ifdef XR_USE_GRAPHICS_API_OPENGL
++#if defined(XR_USE_PLATFORM_XLIB) || defined(XR_USE_PLATFORM_XCB)
++#include <GL/glx.h>
++#endif  // (XR_USE_PLATFORM_XLIB || XR_USE_PLATFORM_XCB)
++#endif
+ #include <vector>
+ 
+ #include "base/logging.h"
+diff --git a/third_party/openxr/BUILD.gn b/third_party/openxr/BUILD.gn
+index 0577fcfd1381a..71a9b1f8dd2b6 100644
+--- a/third_party/openxr/BUILD.gn
++++ b/third_party/openxr/BUILD.gn
+@@ -87,5 +87,15 @@ if (enable_openxr) {
+         "XR_USE_GRAPHICS_API_D3D11",
+       ]
+     }
++
++    if (is_linux) {
++      defines = [
++        "XRLOADER_DISABLE_EXCEPTION_HANDLING",
++        "XR_OS_LINUX",
++        "XR_USE_GRAPHICS_API_OPENGL",
++        "XR_USE_PLATFORM_XLIB",
++        "XR_USE_TIMESPEC",
++      ]
++    }
+   }
+ }
+-- 
+2.37.1
+

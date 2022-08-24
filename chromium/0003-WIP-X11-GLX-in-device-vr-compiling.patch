@@ -1,0 +1,155 @@
+From e40c09d29ea7f550d87f5fa020b6cdac71a574be Mon Sep 17 00:00:00 2001
+From: Noeri Huisman <mrxz@users.noreply.github.com>
+Date: Wed, 17 Aug 2022 09:54:33 +0200
+Subject: [PATCH 3/6] WIP X11/GLX in device/vr compiling
+
+---
+ device/vr/BUILD.gn                         |  7 +++
+ device/vr/openxr/openxr_api_wrapper.cc     | 53 ++++++++++++++++++++++
+ device/vr/openxr/openxr_extension_helper.h | 27 +++++++++--
+ 3 files changed, 83 insertions(+), 4 deletions(-)
+
+diff --git a/device/vr/BUILD.gn b/device/vr/BUILD.gn
+index a399389c061c7..5a129db2738af 100644
+--- a/device/vr/BUILD.gn
++++ b/device/vr/BUILD.gn
+@@ -187,6 +187,13 @@ if (enable_vr) {
+         deps += [ ":directx_helpers" ]
+       }
+ 
++      if (is_linux) {
++        libs = [ "GLX" ]
++        deps += [
++          "//ui/gfx/x",
++        ]
++      }
++
+       sources += [
+         "openxr/context_provider_callbacks.h",
+         "openxr/openxr_anchor_manager.cc",
+diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
+index 025b29954a2a1..119f3568a173d 100644
+--- a/device/vr/openxr/openxr_api_wrapper.cc
++++ b/device/vr/openxr/openxr_api_wrapper.cc
+@@ -9,6 +9,10 @@
+ #include "gpu/ipc/common/gpu_memory_buffer_impl_dxgi.h"
+ #endif
+ 
++#ifdef XR_USE_GRAPHICS_API_OPENGL
++// #include <GL/glx.h>
++#endif
++
+ #include <stdint.h>
+ #include <algorithm>
+ #include <array>
+@@ -32,6 +36,15 @@
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/geometry/transform.h"
+ 
++//#include "ui/gl/gl_surface_glx.h"
++#include "ui/gfx/x/xproto_util.h"
++#include "ui/gl/glx_util.h"
++#include <GL/gl.h>
++#include <GL/glext.h>
++#define GLX_GLXEXT_PROTOTYPES 1
++#include <GL/glxext.h>
++#include <GL/glxtokens.h>
++
+ namespace device {
+ 
+ namespace {
+@@ -493,6 +506,41 @@ XrResult OpenXrApiWrapper::CreateSession(
+ #endif
+ 
+ #ifdef XR_USE_GRAPHICS_API_OPENGL
++bool CreateDummyWindow(x11::Connection* conn) {
++  DCHECK(conn);
++  auto parent_window = conn->default_root();
++  auto window = conn->GenerateId<x11::Window>();
++  auto create_window = conn->CreateWindow(x11::CreateWindowRequest{
++      .wid = window,
++      .parent = parent_window,
++      .width = 1,
++      .height = 1,
++      .c_class = x11::WindowClass::InputOutput,
++  });
++  if (create_window.Sync().error) {
++    LOG(ERROR) << "Failed to create window";
++    return false;
++  }
++  GLXFBConfig config = gl::GetFbConfigForWindow(conn, window);
++  if (!config) {
++    LOG(ERROR) << "Failed to get GLXConfig";
++    conn->DestroyWindow({window});
++    return false;
++  }
++
++  GLXWindow glx_window = glXCreateWindow(
++      conn->GetXlibDisplay(), config, static_cast<uint32_t>(window), nullptr);
++  if (!glx_window) {
++    LOG(ERROR) << "glXCreateWindow failed";
++    conn->DestroyWindow({window});
++    return false;
++  }
++  glXDestroyWindow(conn->GetXlibDisplay(x11::XlibDisplayType::kFlushing),
++                   glx_window);
++  conn->DestroyWindow({window});
++  return true;
++}
++
+ XrResult OpenXrApiWrapper::CreateSession() {
+   DCHECK(!HasSession());
+   DCHECK(IsInitialized());
+@@ -500,6 +548,11 @@ XrResult OpenXrApiWrapper::CreateSession() {
+   XrGraphicsBindingOpenGLXlibKHR gl_binding = {
+       XR_TYPE_GRAPHICS_BINDING_OPENGL_XLIB_KHR};
+   // TODO: fill gl_binding properties
++  gl_binding.xDisplay = glXGetCurrentDisplay();
++  gl_binding.visualid = 0;
++  gl_binding.glxFBConfig = NULL;
++  gl_binding.glxDrawable = 0;
++  gl_binding.glxContext = NULL;
+ 
+ 
+   XrSessionCreateInfo session_create_info = {XR_TYPE_SESSION_CREATE_INFO};
+diff --git a/device/vr/openxr/openxr_extension_helper.h b/device/vr/openxr/openxr_extension_helper.h
+index 86600b3e432b5..49a4f78016b5b 100644
+--- a/device/vr/openxr/openxr_extension_helper.h
++++ b/device/vr/openxr/openxr_extension_helper.h
+@@ -13,10 +13,29 @@
+ #if defined(XR_USE_PLATFORM_XLIB) || defined(XR_USE_PLATFORM_XCB)
+ //# include <GL/glx.h>
+ 
+-#include <X11/Xlib.h>
+-typedef struct __GLXcontextRec *GLXContext;
+-typedef XID GLXDrawable;
+-typedef struct __GLXFBConfigRec *GLXFBConfig;
++//#include <X11/Xlib.h>
++//#include <X11/Xutil.h>
++//typedef struct __GLXcontextRec *GLXContext;
++//typedef XID GLXDrawable;
++//typedef struct __GLXFBConfigRec *GLXFBConfig;
++//#include "ui/gl/gl_bindings.h"
++
++using Display = struct _XDisplay;
++using Bool = int;
++using Status = int;
++using XID = unsigned long;
++using Colormap = XID;
++using Font = XID;
++using Pixmap = XID;
++using Window = XID;
++using GLXPixmap = XID;
++using GLXWindow = XID;
++using GLXDrawable = XID;
++using GLXPbuffer = XID;
++using GLXContextID = XID;
++using GLXContext = struct __GLXcontextRec*;
++using GLXFBConfig = struct __GLXFBConfigRec*;
++struct XVisualInfo;
+ 
+ #endif  // (XR_USE_PLATFORM_XLIB || XR_USE_PLATFORM_XCB)
+ #endif
+-- 
+2.37.1
+

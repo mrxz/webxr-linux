@@ -1,0 +1,174 @@
+From 14adda70f22e414ab96fb0f366569fa78afeca24 Mon Sep 17 00:00:00 2001
+From: Noeri Huisman <mrxz@users.noreply.github.com>
+Date: Sat, 20 Aug 2022 18:26:40 +0200
+Subject: [PATCH 6/6] At least the flow short of works, just need to be able to
+ share the image/texture/framebuffer.... :-/
+
+---
+ device/vr/openxr/openxr_api_wrapper.cc        |  6 +++-
+ device/vr/openxr/openxr_render_loop.cc        |  3 +-
+ device/vr/public/mojom/vr_service.mojom       |  1 -
+ device/vr/windows/compositor_base.cc          |  4 +--
+ device/vr/windows/compositor_base.h           |  2 --
+ .../graphics/gpu/xr_frame_transport.cc        | 28 +++++++++++++++++--
+ 6 files changed, 33 insertions(+), 11 deletions(-)
+
+diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
+index a4b99105656f4..85ad3746e770c 100644
+--- a/device/vr/openxr/openxr_api_wrapper.cc
++++ b/device/vr/openxr/openxr_api_wrapper.cc
+@@ -1014,7 +1014,9 @@ XrResult OpenXrApiWrapper::BeginFrame() {
+   if (!session_running_)
+     return XR_ERROR_SESSION_NOT_RUNNING;
+ 
+-XrFrameWaitInfo wait_frame_info = {XR_TYPE_FRAME_WAIT_INFO};
++  DLOG(INFO) << ">>>>>>>>>>>>>>>>> BeginFrame";
++
++  XrFrameWaitInfo wait_frame_info = {XR_TYPE_FRAME_WAIT_INFO};
+   XrFrameState frame_state = {XR_TYPE_FRAME_STATE};
+ 
+   XrSecondaryViewConfigurationFrameStateMSFT secondary_view_frame_states = {
+@@ -1201,6 +1203,8 @@ XrResult OpenXrApiWrapper::EndFrame() {
+   DCHECK(HasSpace(XR_REFERENCE_SPACE_TYPE_LOCAL));
+   DCHECK(HasFrameState());
+ 
++  DLOG(INFO) << "<<<<<<<<<<<<<<<<< EndFrame";
++
+   XrSwapchainImageReleaseInfo release_info = {
+       XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+   RETURN_IF_XR_FAILED(xrReleaseSwapchainImage(color_swapchain_, &release_info));
+diff --git a/device/vr/openxr/openxr_render_loop.cc b/device/vr/openxr/openxr_render_loop.cc
+index ee2fade0ed612..014092ad6f541 100644
+--- a/device/vr/openxr/openxr_render_loop.cc
++++ b/device/vr/openxr/openxr_render_loop.cc
+@@ -153,8 +153,7 @@ void OpenXrRenderLoop::StartRuntime(
+     ExitPresent();
+     std::move(start_runtime_split_callback.second).Run(false);
+   }
+-#endif
+-#ifdef XR_USE_GRAPHICS_API_OPENGL
++#else
+   if(XR_FAILED(openxr_->InitSession(
+           enabled_features_, extension_helper_,
+           std::move(on_session_started_callback),
+diff --git a/device/vr/public/mojom/vr_service.mojom b/device/vr/public/mojom/vr_service.mojom
+index 66df27a914d3b..0e59ff5f63b92 100644
+--- a/device/vr/public/mojom/vr_service.mojom
++++ b/device/vr/public/mojom/vr_service.mojom
+@@ -1173,7 +1173,6 @@ interface XRPresentationProvider {
+ 
+   // XRPresentationTransportMethod SUBMIT_AS_TEXTURE_HANDLE
+   // |texture| should only be used after |sync_token| has passed.
+-  [EnableIf=is_win]
+   SubmitFrameWithTextureHandle(int16 frameId, handle<platform> texture,
+                                gpu.mojom.SyncToken sync_token);
+ 
+diff --git a/device/vr/windows/compositor_base.cc b/device/vr/windows/compositor_base.cc
+index 3d2fd059cfebc..abdf7ab6fa275 100644
+--- a/device/vr/windows/compositor_base.cc
++++ b/device/vr/windows/compositor_base.cc
+@@ -120,7 +120,6 @@ void XRCompositorCommon::SubmitFrameDrawnIntoTexture(
+   NOTREACHED();
+ }
+ 
+-#if BUILDFLAG(IS_WIN)
+ void XRCompositorCommon::SubmitFrameWithTextureHandle(
+     int16_t frame_index,
+     mojo::PlatformHandle texture_handle,
+@@ -146,17 +145,18 @@ void XRCompositorCommon::SubmitFrameWithTextureHandle(
+   pending_frame_->waiting_for_webxr_ = false;
+   pending_frame_->submit_frame_time_ = base::TimeTicks::Now();
+ 
++#if BUILDFLAG(IS_WIN)
+   base::win::ScopedHandle scoped_handle = texture_handle.is_valid()
+                                               ? texture_handle.TakeHandle()
+                                               : base::win::ScopedHandle();
+   texture_helper_.SetSourceTexture(std::move(scoped_handle), sync_token,
+                                    left_webxr_bounds_, right_webxr_bounds_);
+   pending_frame_->webxr_submitted_ = true;
++#endif
+ 
+   // Regardless of success - try to composite what we have.
+   MaybeCompositeAndSubmit();
+ }
+-#endif
+ 
+ void XRCompositorCommon::CleanUp() {
+   submit_client_.reset();
+diff --git a/device/vr/windows/compositor_base.h b/device/vr/windows/compositor_base.h
+index df1c1dc45f4dd..d3eace4d34578 100644
+--- a/device/vr/windows/compositor_base.h
++++ b/device/vr/windows/compositor_base.h
+@@ -123,11 +123,9 @@ class XRCompositorCommon : public base::Thread,
+   // processes
+   virtual bool IsUsingSharedImages() const;
+ 
+-#if BUILDFLAG(IS_WIN)
+   void SubmitFrameWithTextureHandle(int16_t frame_index,
+                                     mojo::PlatformHandle texture_handle,
+                                     const gpu::SyncToken& sync_token) final;
+-#endif
+ 
+  private:
+   // base::Thread overrides:
+diff --git a/third_party/blink/renderer/platform/graphics/gpu/xr_frame_transport.cc b/third_party/blink/renderer/platform/graphics/gpu/xr_frame_transport.cc
+index f8b203fee866d..11ea9165a5d89 100644
+--- a/third_party/blink/renderer/platform/graphics/gpu/xr_frame_transport.cc
++++ b/third_party/blink/renderer/platform/graphics/gpu/xr_frame_transport.cc
+@@ -98,6 +98,8 @@ void XRFrameTransport::FrameSubmitMissing(
+   vr_presentation_provider->SubmitFrameMissing(vr_frame_id, sync_token);
+ }
+ 
++uint8_t* pixelsBuffer = nullptr;
++
+ void XRFrameTransport::FrameSubmit(
+     device::mojom::blink::XRPresentationProvider* vr_presentation_provider,
+     gpu::gles2::GLES2Interface* gl,
+@@ -110,12 +112,34 @@ void XRFrameTransport::FrameSubmit(
+   if (transport_options_->transport_method ==
+       device::mojom::blink::XRPresentationTransportMethod::
+           SUBMIT_AS_TEXTURE_HANDLE) {
+-#if BUILDFLAG(IS_WIN)
++
+     TRACE_EVENT0("gpu", "XRFrameTransport::CopyImage");
+     // Update last_transfer_succeeded_ value. This should usually complete
+     // without waiting.
+     if (transport_options_->wait_for_transfer_notification)
+       WaitForPreviousTransfer();
++
++    // HACK
++    int width = image_ref->width();
++    int height = image_ref->height();
++    LOG(INFO) << "Dimensions: " << width << "x" << height;
++    if(!pixelsBuffer) {
++      pixelsBuffer = (uint8_t*)malloc(width * height * 4);
++    }
++    //gl->ReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, pixelsBuffer);
++    //LOG(INFO) << "Top-left " << pixelsBuffer[0] << " " << pixelsBuffer[1] << " " << pixelsBuffer[2];
++
++    // FIXME: Is this needed?
++    drawing_buffer_client->DrawingBufferClientRestoreTexture2DBinding();
++    drawing_buffer_client->DrawingBufferClientRestoreFramebufferBinding();
++    drawing_buffer_client->DrawingBufferClientRestoreRenderbufferBinding();
++
++    if(1 == 1) {
++      FrameSubmitMissing(vr_presentation_provider, gl, vr_frame_id);
++      return;
++    }
++
++#if BUILDFLAG(IS_WIN)
+     if (!frame_copier_ || !last_transfer_succeeded_) {
+       frame_copier_ = std::make_unique<GpuMemoryBufferImageCopy>(gl, sii);
+     }
+@@ -143,8 +167,6 @@ void XRFrameTransport::FrameSubmit(
+     vr_presentation_provider->SubmitFrameWithTextureHandle(
+         vr_frame_id, mojo::PlatformHandle(std::move(gpu_handle.dxgi_handle)),
+         sync_token);
+-#else
+-    NOTIMPLEMENTED();
+ #endif
+   } else if (transport_options_->transport_method ==
+              device::mojom::blink::XRPresentationTransportMethod::
+-- 
+2.37.1
+

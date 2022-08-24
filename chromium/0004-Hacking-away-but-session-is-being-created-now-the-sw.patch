@@ -1,0 +1,248 @@
+From 9d5d185f63149d532dd1499fabd5baf37dcf8092 Mon Sep 17 00:00:00 2001
+From: Noeri Huisman <mrxz@users.noreply.github.com>
+Date: Sat, 20 Aug 2022 12:14:00 +0200
+Subject: [PATCH 4/6] Hacking away, but session is being created, now the
+ swapchain
+
+---
+ device/vr/BUILD.gn                         |   4 +-
+ device/vr/openxr/openxr_api_wrapper.cc     | 135 +++++++++++++--------
+ device/vr/openxr/openxr_extension_helper.h |   1 -
+ device/vr/openxr/openxr_util.cc            |  10 +-
+ 4 files changed, 99 insertions(+), 51 deletions(-)
+
+diff --git a/device/vr/BUILD.gn b/device/vr/BUILD.gn
+index 5a129db2738af..7e0574a26e32e 100644
+--- a/device/vr/BUILD.gn
++++ b/device/vr/BUILD.gn
+@@ -188,9 +188,11 @@ if (enable_vr) {
+       }
+ 
+       if (is_linux) {
+-        libs = [ "GLX" ]
++        libs = [ "GL", "GLX", "X11", ]
+         deps += [
++          "//ui/base/x",
+           "//ui/gfx/x",
++          "//ui/gl/init",
+         ]
+       }
+ 
+diff --git a/device/vr/openxr/openxr_api_wrapper.cc b/device/vr/openxr/openxr_api_wrapper.cc
+index 119f3568a173d..27bd115dce1ee 100644
+--- a/device/vr/openxr/openxr_api_wrapper.cc
++++ b/device/vr/openxr/openxr_api_wrapper.cc
+@@ -36,12 +36,18 @@
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/geometry/transform.h"
+ 
+-//#include "ui/gl/gl_surface_glx.h"
++#include "ui/gl/gl_surface_glx.h"
++#include "ui/gl/gl_surface_glx_x11.h"
+ #include "ui/gfx/x/xproto_util.h"
++#include "ui/base/x/visual_picker_glx.h"
++#include "ui/gl/gl_context.h"
+ #include "ui/gl/glx_util.h"
++#include "ui/gl/gl_utils.h"
++#include "ui/gl/init/gl_factory.h"
++#include "ui/gl/gl_context_glx.h"
+ #include <GL/gl.h>
+ #include <GL/glext.h>
+-#define GLX_GLXEXT_PROTOTYPES 1
++#include <GL/glx.h>
+ #include <GL/glxext.h>
+ #include <GL/glxtokens.h>
+ 
+@@ -452,6 +458,10 @@ XrResult OpenXrApiWrapper::InitSession(
+ #ifdef XR_USE_GRAPHICS_API_D3D11
+   RETURN_IF_XR_FAILED(CreateSession(d3d_device));
+ #else
++  // Need to request OpenGL requirements for session
++  XrGraphicsRequirementsOpenGLKHR opengl_reqs = {.type = XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR, .next = NULL};
++  extension_helper.ExtensionMethods().xrGetOpenGLGraphicsRequirementsKHR(instance_, system_, &opengl_reqs);
++
+   RETURN_IF_XR_FAILED(CreateSession());
+ #endif
+   RETURN_IF_XR_FAILED(CreateSwapchain());
+@@ -505,63 +515,92 @@ XrResult OpenXrApiWrapper::CreateSession(
+ }
+ #endif
+ 
+-#ifdef XR_USE_GRAPHICS_API_OPENGL
+-bool CreateDummyWindow(x11::Connection* conn) {
+-  DCHECK(conn);
+-  auto parent_window = conn->default_root();
+-  auto window = conn->GenerateId<x11::Window>();
+-  auto create_window = conn->CreateWindow(x11::CreateWindowRequest{
+-      .wid = window,
+-      .parent = parent_window,
+-      .width = 1,
+-      .height = 1,
+-      .c_class = x11::WindowClass::InputOutput,
+-  });
+-  if (create_window.Sync().error) {
+-    LOG(ERROR) << "Failed to create window";
+-    return false;
+-  }
+-  GLXFBConfig config = gl::GetFbConfigForWindow(conn, window);
+-  if (!config) {
+-    LOG(ERROR) << "Failed to get GLXConfig";
+-    conn->DestroyWindow({window});
+-    return false;
+-  }
+-
+-  GLXWindow glx_window = glXCreateWindow(
+-      conn->GetXlibDisplay(), config, static_cast<uint32_t>(window), nullptr);
+-  if (!glx_window) {
+-    LOG(ERROR) << "glXCreateWindow failed";
+-    conn->DestroyWindow({window});
+-    return false;
+-  }
+-  glXDestroyWindow(conn->GetXlibDisplay(x11::XlibDisplayType::kFlushing),
+-                   glx_window);
+-  conn->DestroyWindow({window});
+-  return true;
+-}
+-
++//#ifdef XR_USE_GRAPHICS_API_OPENGL
++typedef GLXContext (*glXCreateContextAttribsARBProc)(Display*, GLXFBConfig, GLXContext, Bool, const int*);
+ XrResult OpenXrApiWrapper::CreateSession() {
+   DCHECK(!HasSession());
+   DCHECK(IsInitialized());
+ 
+-  XrGraphicsBindingOpenGLXlibKHR gl_binding = {
+-      XR_TYPE_GRAPHICS_BINDING_OPENGL_XLIB_KHR};
+-  // TODO: fill gl_binding properties
+-  gl_binding.xDisplay = glXGetCurrentDisplay();
+-  gl_binding.visualid = 0;
+-  gl_binding.glxFBConfig = NULL;
+-  gl_binding.glxDrawable = 0;
+-  gl_binding.glxContext = NULL;
++  //
++  Display* display = XOpenDisplay(0);
++  LOG(INFO) << "DisplayX11 = " << display << " vs " << XOpenDisplay(0);
++
++  static int visual_attribs[] = {
++    GLX_RENDER_TYPE, GLX_RGBA_BIT,
++    GLX_DRAWABLE_TYPE, GLX_WINDOW_BIT,
++    GLX_DOUBLEBUFFER, true,
++    0
++  };
++
++  int num_fbc = 0;
++  GLXFBConfig *fbc = glXChooseFBConfig(display, DefaultScreen(display), visual_attribs, &num_fbc);
++  if (!fbc) {
++      LOG(INFO) << "glXChooseFBConfig() failed";
++  }
++
++  XVisualInfo *vi = glXGetVisualFromFBConfig(display, fbc[0]);
++
++  XSetWindowAttributes swa;
++  LOG(INFO) << "Creating colormap";
++  swa.colormap = XCreateColormap(display, RootWindow(display, vi->screen), vi->visual, AllocNone);
++  swa.border_pixel = 0;
++  swa.event_mask = StructureNotifyMask;
++
++  LOG(INFO) << "Creating window";
++  Window win = XCreateWindow(display, RootWindow(display, vi->screen), 0, 0, 100, 100, 0, vi->depth, InputOutput, vi->visual, CWBorderPixel|CWColormap|CWEventMask, &swa);
++  DCHECK(win);
++  XMapWindow(display, win);
++
++  LOG(INFO) << "Creating GLX Context";
++  GLXContext ctx_old = glXCreateContext(display, vi, 0, GL_TRUE);
++  LOG(INFO) << "GLX Context = " << ctx_old;
++  glXCreateContextAttribsARBProc glXCreateContextAttribsARB =  (glXCreateContextAttribsARBProc)glXGetProcAddress((const GLubyte*)"glXCreateContextAttribsARB");
++  glXMakeCurrent(display, 0, 0);
++  glXDestroyContext(display, ctx_old);
++  DCHECK(glXCreateContextAttribsARB);
++
++  // New style
++  static int context_attribs[] =
++  {
++      GLX_CONTEXT_MAJOR_VERSION_ARB, 4,
++      GLX_CONTEXT_MINOR_VERSION_ARB, 6,
++      GLX_CONTEXT_PROFILE_MASK_ARB, GLX_CONTEXT_CORE_PROFILE_BIT_ARB,
++      GLX_CONTEXT_FLAGS_ARB, GLX_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB,
++      None
++  };
++  GLXContext ctx = glXCreateContextAttribsARB(display, fbc[0], NULL, true, context_attribs);
++  LOG(INFO) << "GLX Context = " << ctx;
++  auto res = glXMakeCurrent(display, win, ctx);
++  LOG(INFO) << "Make current = " << res;
++
++  int visualid;
++  glXGetFBConfigAttrib(display, fbc[0], GLX_VISUAL_ID, &visualid);
++  LOG(INFO) << "VisualID = " << visualid << " not " << vi->visualid;
++
++  // TODO
++  XrGraphicsBindingOpenGLXlibKHR gl_binding {
++    .type = XR_TYPE_GRAPHICS_BINDING_OPENGL_XLIB_KHR,
++    .xDisplay = display,
++    .visualid = (uint32_t)vi->visualid,
++    .glxFBConfig = fbc[0],
++    .glxDrawable = (GLXDrawable)win,
++    .glxContext = ctx,
++  };
+ 
++  GLint majVers = 0, minVers = 0;
++  glGetIntegerv(GL_MAJOR_VERSION, &majVers);
++  glGetIntegerv(GL_MINOR_VERSION, &minVers);
++  LOG(INFO) << "Running GL version " << majVers << "." << minVers;
+ 
+   XrSessionCreateInfo session_create_info = {XR_TYPE_SESSION_CREATE_INFO};
+   session_create_info.next = &gl_binding;
+   session_create_info.systemId = system_;
+ 
+-  return xrCreateSession(instance_, &session_create_info, &session_);
++  XrResult xrResult = xrCreateSession(instance_, &session_create_info, &session_);
++  LOG(INFO) << "xrCreateSession result = " << xrResult;
++  return xrResult;
+ }
+-#endif
++//#endif
+ 
+ XrResult OpenXrApiWrapper::CreateSwapchain() {
+   DCHECK(IsInitialized());
+diff --git a/device/vr/openxr/openxr_extension_helper.h b/device/vr/openxr/openxr_extension_helper.h
+index 49a4f78016b5b..11f57c061f22c 100644
+--- a/device/vr/openxr/openxr_extension_helper.h
++++ b/device/vr/openxr/openxr_extension_helper.h
+@@ -35,7 +35,6 @@ using GLXPbuffer = XID;
+ using GLXContextID = XID;
+ using GLXContext = struct __GLXcontextRec*;
+ using GLXFBConfig = struct __GLXFBConfigRec*;
+-struct XVisualInfo;
+ 
+ #endif  // (XR_USE_PLATFORM_XLIB || XR_USE_PLATFORM_XCB)
+ #endif
+diff --git a/device/vr/openxr/openxr_util.cc b/device/vr/openxr/openxr_util.cc
+index 6da87b9935940..cd7a6750fe0b4 100644
+--- a/device/vr/openxr/openxr_util.cc
++++ b/device/vr/openxr/openxr_util.cc
+@@ -138,7 +138,10 @@ XrResult CreateInstance(
+   auto EnableExtensionIfSupported = [&extension_enumeration,
+                                      &extensions](const char* extension) {
+     if (extension_enumeration.ExtensionSupported(extension)) {
+-      extensions.push_back(extension);
++      (void)extensions;
++      // FIXME: Don't enable extensions for now
++      //extensions.push_back(extension);
++      DLOG(INFO) << "Wanted to enable extension " << extension << " but surpressed";
+     }
+   };
+ 
+@@ -169,6 +172,11 @@ XrResult CreateInstance(
+       static_cast<uint32_t>(extensions.size());
+   instance_create_info.enabledExtensionNames = extensions.data();
+ 
++  LOG(INFO) << "Enabling " << instance_create_info.enabledExtensionCount << "extensions";
++  for(auto *extension : extensions) {
++    LOG(INFO) << "\t" << extension;
++  }
++
+   return xrCreateInstance(&instance_create_info, instance);
+ }
+ 
+-- 
+2.37.1
+
