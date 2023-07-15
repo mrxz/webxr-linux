@@ -198,7 +198,7 @@ index 0000000000..5ed14b2961
 +}
 +
 +XrResult OpenXrGraphicsBindingVulkan::SetupBinding(XrInstance instance, XrSystemId system) {
-+  static StaticLibrary libvulkan = LoadNativeLibrary("libvulkan.so");
++  static StaticLibrary libvulkan = LoadNativeLibrary("libvulkan.so.1");
 +  const PFN_vkGetInstanceProcAddr pfn_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(base::GetFunctionPointerFromNativeLibrary(libvulkan, "vkGetInstanceProcAddr"));
 +  if(!pfn_vkGetInstanceProcAddr) {
 +    LOG(ERROR) << "vkGetInstanceProcAddr() not available";
@@ -803,7 +803,7 @@ index 0000000000..17af1a1df1
 +
 +namespace device {
 +
-+class OpenXrPlatformHelperLinux : public OpenXrPlatformHelper {
++class DEVICE_VR_EXPORT OpenXrPlatformHelperLinux : public OpenXrPlatformHelper {
 + public:
 +  OpenXrPlatformHelperLinux();
 +  ~OpenXrPlatformHelperLinux() override;
