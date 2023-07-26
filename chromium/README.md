@@ -18,8 +18,7 @@ Once applied, build using `autoninja`. In order for chromium to find your config
 ```
 
 ## Other relevant things to mention
- * Swapchain resizing is not implemented, but should be relatively trivial to add.
- * A copy of [this patch](https://groups.google.com/a/chromium.org/g/ozone-reviews/c/W8KlDt40SQY) is included to fix an issue preventing texture sharing.
+ * A copy of [this patch](https://chromium-review.googlesource.com/c/chromium/src/+/4361799) is included to fix an issue preventing texture sharing.
  * Two texture copies are involved in the frame transfer: an ANGLE->Vulkan copy in the GPU process and a Vulkan->OpenXR copy in the XR process.
     * A call to `GLES2Interface::Finish()` is used to synchronize these two copies. A GPU-side semaphore would offer significantly reduced frametimes, but Chromium doesn't seem to offer a working IPC interface for them under Linux (the provided `gfx::GpuFence` interface is only implemented under Windows and Android).
     * The second copy is needed due to OpenXR's swapchain textures not being suitable for inter-process sharing.

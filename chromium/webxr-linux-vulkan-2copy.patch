@@ -107,10 +107,10 @@ index 0e7880f97e..323b21c7ec 100644
    std::unique_ptr<device::OpenXrDevice> openxr_device_;
  
 diff --git a/device/vr/BUILD.gn b/device/vr/BUILD.gn
-index 7893093074..f0682274ba 100644
+index 7893093074..57a3237327 100644
 --- a/device/vr/BUILD.gn
 +++ b/device/vr/BUILD.gn
-@@ -244,6 +244,19 @@ if (enable_vr) {
+@@ -244,6 +244,21 @@ if (enable_vr) {
          deps += [ ":directx_helpers" ]
        }
  
@@ -125,6 +125,8 @@ index 7893093074..f0682274ba 100644
 +          "openxr/linux/openxr_platform_helper_linux.cc",
 +          "openxr/linux/openxr_platform_helper_linux.h",
 +        ]
++
++        configs += [ "//gpu/vulkan:vulkan_config" ]
 +      }
 +
        if (is_android) {
@@ -145,16 +147,17 @@ index 6f69f9ee24..78ad912411 100644
  declare_args() {
 diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
 new file mode 100644
-index 0000000000..5ed14b2961
+index 0000000000..3d6961734e
 --- /dev/null
 +++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.cc
-@@ -0,0 +1,470 @@
+@@ -0,0 +1,401 @@
 +#include "device/vr/openxr/linux/openxr_graphics_binding_vulkan.h"
 +#include "base/containers/contains.h"
 +#include "base/native_library.h"
 +#include "device/vr/openxr/openxr_util.h"
 +#include "gpu/command_buffer/common/shared_image_usage.h"
 +#include "gpu/ipc/common/gpu_memory_buffer_support.h"
++#include "gpu/vulkan/vulkan_function_pointers.h"
 +#include "ui/gfx/color_space.h"
 +
 +namespace device {
@@ -169,17 +172,23 @@ index 0000000000..5ed14b2961
 +
 +OpenXrGraphicsBindingVulkan::OpenXrGraphicsBindingVulkan() = default;
 +OpenXrGraphicsBindingVulkan::~OpenXrGraphicsBindingVulkan() {
-+  if(!initialized_)
-+    return;
-+  pfn_vkDeviceWaitIdle_(binding_.device);
-+  if(gpuTransferImage_)
-+    pfn_vkDestroyImage_(binding_.device, gpuTransferImage_, nullptr);
-+  if(gpuTransferMemory_)
-+    pfn_vkFreeMemory_(binding_.device, gpuTransferMemory_, nullptr);
-+  pfn_vkDestroyFence_(binding_.device, copyFence_, nullptr);
-+  pfn_vkFreeCommandBuffers_(binding_.device, commandPool_, 1, &commandBuffer_);
-+  pfn_vkDestroyCommandPool_(binding_.device, commandPool_, nullptr);
-+  pfn_vkDestroyDevice_(binding_.device, nullptr);
++  if (initialized_)
++    vkDeviceWaitIdle(binding_.device);
++  if (gpuTransferImage_)
++    vkDestroyImage(binding_.device, gpuTransferImage_, nullptr);
++  if (gpuTransferMemory_)
++    vkFreeMemory(binding_.device, gpuTransferMemory_, nullptr);
++  if (commandBuffer_)
++    commandBuffer_->Destroy();
++  commandBuffer_.reset();
++  if (commandPool_)
++    commandPool_->Destroy();
++  commandPool_.reset();
++  if (copyQueue_)
++    copyQueue_->Destroy();
++  copyQueue_.reset();
++  if (binding_.device)
++    vkDestroyDevice(binding_.device, nullptr);
 +}
 +
 +struct StaticLibrary {
@@ -199,14 +208,13 @@ index 0000000000..5ed14b2961
 +
 +XrResult OpenXrGraphicsBindingVulkan::SetupBinding(XrInstance instance, XrSystemId system) {
 +  static StaticLibrary libvulkan = LoadNativeLibrary("libvulkan.so.1");
-+  const PFN_vkGetInstanceProcAddr pfn_vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(base::GetFunctionPointerFromNativeLibrary(libvulkan, "vkGetInstanceProcAddr"));
-+  if(!pfn_vkGetInstanceProcAddr) {
-+    LOG(ERROR) << "vkGetInstanceProcAddr() not available";
++  gpu::VulkanFunctionPointers *const vulkan_function_pointers = gpu::GetVulkanFunctionPointers();
++  vulkan_function_pointers->ResetForTesting();
++  if (!vulkan_function_pointers->BindUnassociatedFunctionPointersFromLoaderLib(libvulkan))
 +    return XR_ERROR_RUNTIME_FAILURE;
-+  }
 +
-+  PFN_xrGetVulkanGraphicsRequirements2KHR getVulkanGraphicsRequirements2KHR = nullptr;
-+  RETURN_IF_XR_FAILED(xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsRequirements2KHR", (PFN_xrVoidFunction*)(&getVulkanGraphicsRequirements2KHR)));
++  PFN_xrGetVulkanGraphicsRequirements2KHR pfn_xrGetVulkanGraphicsRequirements2KHR = nullptr;
++  RETURN_IF_XR_FAILED(xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsRequirements2KHR", (PFN_xrVoidFunction*)(&pfn_xrGetVulkanGraphicsRequirements2KHR)));
 +  PFN_xrCreateVulkanInstanceKHR pfn_xrCreateVulkanInstanceKHR = nullptr;
 +  RETURN_IF_XR_FAILED(xrGetInstanceProcAddr(instance, "xrCreateVulkanInstanceKHR", (PFN_xrVoidFunction*)(&pfn_xrCreateVulkanInstanceKHR)));
 +  PFN_xrGetVulkanGraphicsDevice2KHR pfn_xrGetVulkanGraphicsDevice2KHR = nullptr;
@@ -215,18 +223,18 @@ index 0000000000..5ed14b2961
 +  RETURN_IF_XR_FAILED(xrGetInstanceProcAddr(instance, "xrCreateVulkanDeviceKHR", (PFN_xrVoidFunction*)(&pfn_xrCreateVulkanDeviceKHR)));
 +
 +  XrGraphicsRequirementsVulkan2KHR requirements = {XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR};
-+  RETURN_IF_XR_FAILED(getVulkanGraphicsRequirements2KHR(instance, system, &requirements));
++  RETURN_IF_XR_FAILED(pfn_xrGetVulkanGraphicsRequirements2KHR(instance, system, &requirements));
 +  VkResult result;
 +  RETURN_IF_XR_FAILED(pfn_xrCreateVulkanInstanceKHR(instance, (const XrVulkanInstanceCreateInfoKHR[1]){{
 +    .type = XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR,
 +    .systemId = system,
-+    .pfnGetInstanceProcAddr = pfn_vkGetInstanceProcAddr,
++    .pfnGetInstanceProcAddr = vulkan_function_pointers->vkGetInstanceProcAddr.get(),
 +    .vulkanCreateInfo = (const VkInstanceCreateInfo[1]){{
 +      .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
 +      .pApplicationInfo = (const VkApplicationInfo[1]){{
 +        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
 +        .pApplicationName = "Chromium",
-+        .apiVersion = VK_API_VERSION_1_1,
++        .apiVersion = gpu::kVulkanRequiredApiVersion,
 +      }},
 +      /*.enabledLayerCount = 1,
 +      .ppEnabledLayerNames = (const char *const[1]){
@@ -236,37 +244,19 @@ index 0000000000..5ed14b2961
 +  }}, &binding_.instance, &result));
 +  RETURN_IF(result < VK_SUCCESS, XR_ERROR_RUNTIME_FAILURE, "xrCreateVulkanInstanceKHR() failed");
 +
-+  const PFN_vkAllocateCommandBuffers pfn_vkAllocateCommandBuffers = reinterpret_cast<PFN_vkAllocateCommandBuffers>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkAllocateCommandBuffers"));
-+  pfn_vkAllocateMemory_ = reinterpret_cast<PFN_vkAllocateMemory>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkAllocateMemory"));
-+  pfn_vkBeginCommandBuffer_ = reinterpret_cast<PFN_vkBeginCommandBuffer>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkBeginCommandBuffer"));
-+  pfn_vkBindImageMemory_ = reinterpret_cast<PFN_vkBindImageMemory>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkBindImageMemory"));
-+  pfn_vkCmdCopyImage_ = reinterpret_cast<PFN_vkCmdCopyImage>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkCmdCopyImage"));
-+  pfn_vkCmdPipelineBarrier_ = reinterpret_cast<PFN_vkCmdPipelineBarrier>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkCmdPipelineBarrier"));
-+  const PFN_vkCreateCommandPool pfn_vkCreateCommandPool = reinterpret_cast<PFN_vkCreateCommandPool>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkCreateCommandPool"));
-+  const PFN_vkCreateFence pfn_vkCreateFence = reinterpret_cast<PFN_vkCreateFence>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkCreateFence"));
-+  pfn_vkCreateImage_ = reinterpret_cast<PFN_vkCreateImage>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkCreateImage"));
-+  pfn_vkDestroyCommandPool_ = reinterpret_cast<PFN_vkDestroyCommandPool>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkDestroyCommandPool"));
-+  pfn_vkDestroyDevice_ = reinterpret_cast<PFN_vkDestroyDevice>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkDestroyDevice"));
-+  pfn_vkDestroyFence_ = reinterpret_cast<PFN_vkDestroyFence>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkDestroyFence"));
-+  pfn_vkDestroyImage_ = reinterpret_cast<PFN_vkDestroyImage>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkDestroyImage"));
-+  pfn_vkDeviceWaitIdle_ = reinterpret_cast<PFN_vkDeviceWaitIdle>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkDeviceWaitIdle"));
-+  pfn_vkEndCommandBuffer_ = reinterpret_cast<PFN_vkEndCommandBuffer>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkEndCommandBuffer"));
-+  pfn_vkFreeCommandBuffers_ = reinterpret_cast<PFN_vkFreeCommandBuffers>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkFreeCommandBuffers"));
-+  pfn_vkFreeMemory_ = reinterpret_cast<PFN_vkFreeMemory>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkFreeMemory"));
-+  const PFN_vkGetDeviceQueue pfn_vkGetDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkGetDeviceQueue"));
-+  if(haveDrmFormatModifiers_)
-+    pfn_vkGetImageDrmFormatModifierPropertiesEXT_ = reinterpret_cast<PFN_vkGetImageDrmFormatModifierPropertiesEXT>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkGetImageDrmFormatModifierPropertiesEXT"));
-+  pfn_vkGetImageMemoryRequirements_ = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkGetImageMemoryRequirements"));
-+  pfn_vkGetMemoryFdKHR_ = reinterpret_cast<PFN_vkGetMemoryFdKHR>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkGetMemoryFdKHR"));
-+  pfn_vkGetPhysicalDeviceMemoryProperties_ = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkGetPhysicalDeviceMemoryProperties"));
-+  const PFN_vkGetPhysicalDeviceQueueFamilyProperties pfn_vkGetPhysicalDeviceQueueFamilyProperties = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkGetPhysicalDeviceQueueFamilyProperties"));
-+  pfn_vkQueueSubmit_ = reinterpret_cast<PFN_vkQueueSubmit>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkQueueSubmit"));
-+  pfn_vkResetFences_ = reinterpret_cast<PFN_vkResetFences>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkResetFences"));
-+  pfn_vkWaitForFences_ = reinterpret_cast<PFN_vkWaitForFences>(pfn_vkGetInstanceProcAddr(binding_.instance, "vkWaitForFences"));
-+  if(!(pfn_vkGetPhysicalDeviceQueueFamilyProperties && pfn_vkAllocateCommandBuffers && pfn_vkAllocateMemory_ && pfn_vkBeginCommandBuffer_ && pfn_vkBindImageMemory_ && pfn_vkCmdCopyImage_ && pfn_vkCmdPipelineBarrier_ && pfn_vkCreateCommandPool && pfn_vkCreateFence && pfn_vkCreateImage_ && pfn_vkDestroyCommandPool_ && pfn_vkDestroyDevice_ && pfn_vkDestroyFence_ && pfn_vkDestroyImage_ && pfn_vkDeviceWaitIdle_ && pfn_vkEndCommandBuffer_ && pfn_vkFreeCommandBuffers_ && pfn_vkFreeMemory_ && pfn_vkGetDeviceQueue && pfn_vkGetImageMemoryRequirements_ && pfn_vkGetMemoryFdKHR_ && pfn_vkGetPhysicalDeviceMemoryProperties_ && pfn_vkGetPhysicalDeviceQueueFamilyProperties && pfn_vkQueueSubmit_ && pfn_vkResetFences_ && pfn_vkWaitForFences_)) {
-+    LOG(ERROR) << "vkGetInstanceProcAddr() failed";
++  std::vector<const char*> extensions = {
++    VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
++    VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
++    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
++    VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
++    VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
++  };
++  if (haveDrmFormatModifiers_) // TODO: set `haveDrmFormatModifiers_` if supported
++    extensions.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
++  gfx::ExtensionSet extension_set(std::begin(extensions), std::end(extensions));
++
++  if (!vulkan_function_pointers->BindInstanceFunctionPointers(binding_.instance, gpu::kVulkanRequiredApiVersion, extension_set))
 +    return XR_ERROR_RUNTIME_FAILURE;
-+  }
 +
 +  RETURN_IF_XR_FAILED(pfn_xrGetVulkanGraphicsDevice2KHR(instance, (const XrVulkanGraphicsDeviceGetInfoKHR[1]){{
 +    .type = XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR,
@@ -281,63 +271,53 @@ index 0000000000..5ed14b2961
 +    .pQueuePriorities = &queuePriority,
 +  };
 +  uint32_t queueFamilyCount = 0;
-+  pfn_vkGetPhysicalDeviceQueueFamilyProperties(binding_.physicalDevice, &queueFamilyCount, nullptr);
++  vkGetPhysicalDeviceQueueFamilyProperties(binding_.physicalDevice, &queueFamilyCount, nullptr);
 +  std::vector<VkQueueFamilyProperties> queueFamilyProps(queueFamilyCount);
-+  pfn_vkGetPhysicalDeviceQueueFamilyProperties(binding_.physicalDevice, &queueFamilyCount, &queueFamilyProps[0]);
++  vkGetPhysicalDeviceQueueFamilyProperties(binding_.physicalDevice, &queueFamilyCount, &queueFamilyProps[0]);
 +
 +  for (uint32_t i = 0; i < queueFamilyCount; ++i) {
-+      if (queueFamilyProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
-+          binding_.queueFamilyIndex = queueInfo.queueFamilyIndex = i;
-+          break;
-+      }
++    if (queueFamilyProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) {
++      binding_.queueFamilyIndex = i;
++      break;
++    }
 +  }
++  queueInfo.queueFamilyIndex = binding_.queueFamilyIndex;
++
 +  RETURN_IF_XR_FAILED(pfn_xrCreateVulkanDeviceKHR(instance, (const XrVulkanDeviceCreateInfoKHR[1]){{
 +    .type = XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR,
 +    .systemId = system,
-+    .pfnGetInstanceProcAddr = pfn_vkGetInstanceProcAddr,
++    .pfnGetInstanceProcAddr = vulkan_function_pointers->vkGetInstanceProcAddr.get(),
 +    .vulkanPhysicalDevice = binding_.physicalDevice,
 +    .vulkanCreateInfo = (const VkDeviceCreateInfo[1]){{
 +      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
 +      .queueCreateInfoCount = 1,
 +      .pQueueCreateInfos = &queueInfo,
-+      .enabledExtensionCount = 5,
-+      .ppEnabledExtensionNames = (const char *const[5]){
-+        VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
-+        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
-+        VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
-+        VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
-+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
-+
-+        // VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME, // TODO: set `haveDrmFormatModifiers_` if supported
-+      },
++      .enabledExtensionCount = (uint32_t)extensions.size(),
++      .ppEnabledExtensionNames = &extensions[0],
 +      .pEnabledFeatures = (const VkPhysicalDeviceFeatures[1]){},
 +    }},
 +  }}, &binding_.device, &result));
 +  RETURN_IF(result < VK_SUCCESS, XR_ERROR_RUNTIME_FAILURE, "xrCreateVulkanDeviceKHR() failed");
++  if (!vulkan_function_pointers->BindDeviceFunctionPointers(binding_.device, gpu::kVulkanRequiredApiVersion, extension_set))
++    return XR_ERROR_RUNTIME_FAILURE;
++  vkCmdCopyImage_ = reinterpret_cast<PFN_vkCmdCopyImage>(vkGetDeviceProcAddr(binding_.device, "vkCmdCopyImage"));
++  if (!vkCmdCopyImage_) {
++    DLOG(WARNING) << "Failed to bind vulkan entrypoint: vkCmdCopyImage";
++    return XR_ERROR_RUNTIME_FAILURE;
++  }
 +
 +  binding_.queueIndex = 0;
-+  pfn_vkGetDeviceQueue(binding_.device, binding_.queueFamilyIndex, binding_.queueIndex, &copyQueue_);
-+
-+  result = pfn_vkCreateFence(binding_.device, (const VkFenceCreateInfo[1]){{
-+    .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-+    .flags = VK_FENCE_CREATE_SIGNALED_BIT,
-+  }}, nullptr, &copyFence_);
-+  RETURN_IF(result < VK_SUCCESS, XR_ERROR_RUNTIME_FAILURE, "vkCreateFence() failed");
-+
-+  result = pfn_vkCreateCommandPool(binding_.device, (const VkCommandPoolCreateInfo[1]){{
-+    .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-+    .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-+    .queueFamilyIndex = binding_.queueFamilyIndex,
-+  }}, NULL, &commandPool_);
-+  RETURN_IF(result < VK_SUCCESS, XR_ERROR_RUNTIME_FAILURE, "vkCreateCommandPool() failed");
-+
-+  result = pfn_vkAllocateCommandBuffers(binding_.device, (const VkCommandBufferAllocateInfo[1]){{
-+    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-+    .commandPool = commandPool_,
-+    .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-+    .commandBufferCount = 1,
-+  }}, &commandBuffer_);
-+  RETURN_IF(result < VK_SUCCESS, XR_ERROR_RUNTIME_FAILURE, "vkCreateCommandPool() failed");
++  VkQueue queue = VK_NULL_HANDLE;
++  vkGetDeviceQueue(binding_.device, binding_.queueFamilyIndex, binding_.queueIndex, &queue);
++  copyQueue_ = std::make_unique<gpu::VulkanDeviceQueue>(binding_.instance);
++  if (!copyQueue_->InitializeForWebView(binding_.physicalDevice, binding_.device, queue, binding_.queueFamilyIndex, std::move(extension_set)))
++    return XR_ERROR_RUNTIME_FAILURE;
++  commandPool_ = std::make_unique<gpu::VulkanCommandPool>(copyQueue_.get());
++  if (!commandPool_->Initialize()) // vkCreateCommandPool
++    return XR_ERROR_RUNTIME_FAILURE;
++  commandBuffer_ = commandPool_->CreatePrimaryCommandBuffer(); // vkAllocateCommandBuffers
++  if (!commandBuffer_)
++    return XR_ERROR_RUNTIME_FAILURE;
 +  return XR_SUCCESS;
 +}
 +
@@ -346,7 +326,7 @@ index 0000000000..5ed14b2961
 +    return true;
 +  }
 +
-+  if(XR_FAILED(SetupBinding(instance, system)))
++  if (XR_FAILED(SetupBinding(instance, system)))
 +    return false;
 +  initialized_ = true;
 +  OnSwapchainImageSizeChanged();
@@ -365,7 +345,7 @@ index 0000000000..5ed14b2961
 +  RETURN_IF_XR_FAILED(xrEnumerateSwapchainFormats(session, (uint32_t)swapchain_formats.size(), &format_length, swapchain_formats.data()));
 +  DCHECK(!swapchain_formats.empty());
 +
-+  if(base::Contains(swapchain_formats, VK_FORMAT_R8G8B8A8_SRGB))
++  if (base::Contains(swapchain_formats, VK_FORMAT_R8G8B8A8_SRGB))
 +    return VK_FORMAT_R8G8B8A8_SRGB;
 +
 +  if (!base::Contains(swapchain_formats, VK_FORMAT_R8G8B8A8_UNORM)) {
@@ -421,7 +401,7 @@ index 0000000000..5ed14b2961
 +
 +int32_t OpenXrGraphicsBindingVulkan::FindMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags propFlags) {
 +  VkPhysicalDeviceMemoryProperties props;
-+  pfn_vkGetPhysicalDeviceMemoryProperties_(binding_.physicalDevice, &props);
++  vkGetPhysicalDeviceMemoryProperties(binding_.physicalDevice, &props);
 +  for (uint32_t i = 0; i < props.memoryTypeCount; i++)
 +    if ((typeFilter & (1 << i)) && (props.memoryTypes[i].propertyFlags & propFlags) == propFlags)
 +      return i;
@@ -436,15 +416,15 @@ index 0000000000..5ed14b2961
 +
 +  const gfx::Size size = GetSwapchainImageSize(); // TODO: return early if size hasn't changed
 +
-+  pfn_vkDeviceWaitIdle_(binding_.device);
-+  if(gpuTransferImage_)
-+    pfn_vkDestroyImage_(binding_.device, gpuTransferImage_, nullptr);
++  vkDeviceWaitIdle(binding_.device);
++  if (gpuTransferImage_)
++    vkDestroyImage(binding_.device, gpuTransferImage_, nullptr);
 +  gpuTransferImage_ = nullptr;
-+  if(gpuTransferMemory_)
-+    pfn_vkFreeMemory_(binding_.device, gpuTransferMemory_, nullptr);
++  if (gpuTransferMemory_)
++    vkFreeMemory(binding_.device, gpuTransferMemory_, nullptr);
 +  gpuTransferMemory_ = nullptr;
 +
-+  VkResult result = pfn_vkCreateImage_(binding_.device, (const VkImageCreateInfo[1]){{
++  VkResult result = vkCreateImage(binding_.device, (const VkImageCreateInfo[1]){{
 +    .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 +    .pNext = (const VkExternalMemoryImageCreateInfo[1]){{
 +      .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -457,7 +437,7 @@ index 0000000000..5ed14b2961
 +    .arrayLayers = 1,
 +    .samples = VK_SAMPLE_COUNT_1_BIT,
 +    .tiling = haveDrmFormatModifiers_ ? VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT : VK_IMAGE_TILING_OPTIMAL,
-+    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++    .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
 +    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 +    .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 +  }}, nullptr, &gpuTransferImage_);
@@ -466,14 +446,14 @@ index 0000000000..5ed14b2961
 +    return;
 +  }
 +  VkMemoryRequirements requirements;
-+  pfn_vkGetImageMemoryRequirements_(binding_.device, gpuTransferImage_, &requirements);
++  vkGetImageMemoryRequirements(binding_.device, gpuTransferImage_, &requirements);
 +
 +  const int32_t memoryType = FindMemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 +  if (memoryType == -1) {
 +    LOG(ERROR) << "FindMemoryType() failed";
 +    return;
 +  }
-+  pfn_vkAllocateMemory_(binding_.device, (const VkMemoryAllocateInfo[1]){{
++  vkAllocateMemory(binding_.device, (const VkMemoryAllocateInfo[1]){{
 +    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 +    .pNext = (const VkMemoryDedicatedAllocateInfo[1]){{
 +      .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
@@ -491,19 +471,19 @@ index 0000000000..5ed14b2961
 +    return;
 +  }
 +
-+  result = pfn_vkBindImageMemory_(binding_.device, gpuTransferImage_, gpuTransferMemory_, 0);
++  result = vkBindImageMemory(binding_.device, gpuTransferImage_, gpuTransferMemory_, 0);
 +  if (result != VK_SUCCESS) {
 +    LOG(ERROR) << "vkBindImageMemory failed result:" << result;
 +    return;
 +  }
 +
 +  base::ScopedFD fd;
-+  pfn_vkGetMemoryFdKHR_(binding_.device, (const VkMemoryGetFdInfoKHR[1]){{
++  vkGetMemoryFdKHR(binding_.device, (const VkMemoryGetFdInfoKHR[1]){{
 +    .sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR,
 +    .memory = gpuTransferMemory_,
 +    .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
 +  }}, base::ScopedFD::Receiver(fd).get());
-+  if(!fd.is_valid()) {
++  if (!fd.is_valid()) {
 +    LOG(ERROR) << "vkGetMemoryFdKHR() failed";
 +    return;
 +  }
@@ -512,8 +492,8 @@ index 0000000000..5ed14b2961
 +    .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT,
 +    .drmFormatModifier = gfx::NativePixmapHandle::kNoModifier,
 +  };
-+  if(haveDrmFormatModifiers_) {
-+    result = pfn_vkGetImageDrmFormatModifierPropertiesEXT_(binding_.device, gpuTransferImage_, &modifier_props);
++  if (haveDrmFormatModifiers_) {
++    result = vkGetImageDrmFormatModifierPropertiesEXT(binding_.device, gpuTransferImage_, &modifier_props);
 +    if (result != VK_SUCCESS) {
 +      LOG(ERROR) << "vkGetImageDrmFormatModifierPropertiesEXT failed result:" << result;
 +      return;
@@ -534,8 +514,8 @@ index 0000000000..5ed14b2961
 +  if (imageSize != GetSwapchainImageSize() || !gpuTransferBuffer_)
 +    return;
 +
-+  pfn_vkWaitForFences_(binding_.device, 1, &copyFence_, VK_TRUE, UINT64_MAX);
-+  if(gpuTransferMailbox_.mailbox.IsZero()) {
++  commandBuffer_->Wait(UINT64_MAX);
++  if (gpuTransferMailbox_.mailbox.IsZero()) {
 +    gpuTransferMailbox_.mailbox = sii->CreateSharedImage(viz::SinglePlaneFormat::kBGRA_8888, gpuTransferBuffer_->GetSize(), gfx::ColorSpace(), kBottomLeft_GrSurfaceOrigin, kPremul_SkAlphaType, gpu::SHARED_IMAGE_USAGE_GLES2, "OpenXrGraphicsBindingVulkan", gpuTransferBuffer_->CloneHandle());
 +    gpuTransferMailbox_.sync_token = sii->GenVerifiedSyncToken();
 +    gpuTransferMailbox_.texture_target = GL_TEXTURE_2D;
@@ -550,81 +530,34 @@ index 0000000000..5ed14b2961
 +  gl->Finish(); // CHROMIUM_gpu_fence isn't available on Linux and I'm not sure how else to synchronize this
 +
 +  SwapChainInfo &image = color_swapchain_images_[active_swapchain_index()];
-+  pfn_vkBeginCommandBuffer_(commandBuffer_, (const VkCommandBufferBeginInfo[1]){{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}});
-+  pfn_vkCmdPipelineBarrier_(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, (const VkImageMemoryBarrier[2]){
-+    {
-+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+      .srcAccessMask = 0,
-+      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-+      // .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-+      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+      .image = gpuTransferImage_,
-+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-+    }, {
-+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+      .srcAccessMask = 0,
-+      .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-+      .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-+      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+      .image = image.openxr_image,
-+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-+    }
-+  });
-+  pfn_vkCmdCopyImage_(commandBuffer_, gpuTransferImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.openxr_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, (const VkImageCopy[1]){{
-+    .srcSubresource = {
-+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-+      .layerCount = 1,
-+    },
-+    .dstSubresource = {
-+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-+      .layerCount = 1,
-+    },
-+    .extent = {(uint32_t)imageSize.width(), (uint32_t)imageSize.height(), 1},
-+  }});
-+  pfn_vkCmdPipelineBarrier_(commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 2, (const VkImageMemoryBarrier[2]){
-+    {
-+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+      .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-+      .dstAccessMask = 0,
-+      .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-+      .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+      .image = gpuTransferImage_,
-+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-+    }, {
-+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-+      .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-+      .dstAccessMask = 0,
-+      .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-+      .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-+      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-+      .image = image.openxr_image,
-+      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
-+    }
-+  });
-+  pfn_vkEndCommandBuffer_(commandBuffer_);
-+  pfn_vkResetFences_(binding_.device, 1, &copyFence_);
-+  pfn_vkQueueSubmit_(copyQueue_, 1, (const VkSubmitInfo[1]){{
-+    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-+    .commandBufferCount = 1,
-+    .pCommandBuffers = &commandBuffer_,
-+  }}, copyFence_);
++  {
++    gpu::ScopedSingleUseCommandBufferRecorder recorder(*commandBuffer_); // vkBeginCommandBuffer
++    commandBuffer_->TransitionImageLayout(gpuTransferImage_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    commandBuffer_->TransitionImageLayout(image.openxr_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    vkCmdCopyImage_(recorder.handle(), gpuTransferImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image.openxr_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, (const VkImageCopy[1]){{
++      .srcSubresource = {
++        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++        .layerCount = 1,
++      },
++      .dstSubresource = {
++        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
++        .layerCount = 1,
++      },
++      .extent = {(uint32_t)imageSize.width(), (uint32_t)imageSize.height(), 1},
++    }});
++    commandBuffer_->TransitionImageLayout(gpuTransferImage_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    commandBuffer_->TransitionImageLayout(image.openxr_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
++  } // ~CommandBufferRecorderBase() - vkEndCommandBuffer
++  commandBuffer_->Submit(0, nullptr, 0, nullptr);
 +}
 +
 +} // namespace device
 diff --git a/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
 new file mode 100644
-index 0000000000..9489a51aa0
+index 0000000000..1d82175b65
 --- /dev/null
 +++ b/device/vr/openxr/linux/openxr_graphics_binding_vulkan.h
-@@ -0,0 +1,73 @@
+@@ -0,0 +1,55 @@
 +#pragma once
 +#include <vector>
 +
@@ -633,6 +566,9 @@ index 0000000000..9489a51aa0
 +#include "device/vr/vr_export.h"
 +#include "gpu/command_buffer/client/gles2_interface.h"
 +#include "gpu/command_buffer/client/shared_image_interface.h"
++#include "gpu/vulkan/vulkan_command_buffer.h"
++#include "gpu/vulkan/vulkan_command_pool.h"
++#include "gpu/vulkan/vulkan_device_queue.h"
 +#include "ui/gfx/gpu_memory_buffer.h"
 +
 +namespace device {
@@ -664,37 +600,16 @@ index 0000000000..9489a51aa0
 +  XrGraphicsBindingVulkan2KHR binding_{XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR, nullptr};
 +  std::vector<SwapChainInfo> color_swapchain_images_;
 +
-+  VkCommandPool commandPool_ = nullptr;
-+  VkCommandBuffer commandBuffer_ = nullptr;
-+  VkQueue copyQueue_ = nullptr;
-+  VkFence copyFence_ = nullptr;
++  std::unique_ptr<gpu::VulkanDeviceQueue> copyQueue_ = nullptr;
++  std::unique_ptr<gpu::VulkanCommandPool> commandPool_ = nullptr;
++  std::unique_ptr<gpu::VulkanCommandBuffer> commandBuffer_ = nullptr;
 +
 +  VkImage gpuTransferImage_ = nullptr;
 +  VkDeviceMemory gpuTransferMemory_ = nullptr;
 +  std::unique_ptr<gfx::GpuMemoryBuffer> gpuTransferBuffer_ = nullptr;
 +  gpu::MailboxHolder gpuTransferMailbox_;
 +
-+  PFN_vkAllocateMemory pfn_vkAllocateMemory_ = nullptr;
-+  PFN_vkBeginCommandBuffer pfn_vkBeginCommandBuffer_ = nullptr;
-+  PFN_vkBindImageMemory pfn_vkBindImageMemory_ = nullptr;
-+  PFN_vkCmdCopyImage pfn_vkCmdCopyImage_ = nullptr;
-+  PFN_vkCmdPipelineBarrier pfn_vkCmdPipelineBarrier_ = nullptr;
-+  PFN_vkCreateImage pfn_vkCreateImage_ = nullptr;
-+  PFN_vkDestroyCommandPool pfn_vkDestroyCommandPool_ = nullptr;
-+  PFN_vkDestroyDevice pfn_vkDestroyDevice_ = nullptr;
-+  PFN_vkDestroyFence pfn_vkDestroyFence_ = nullptr;
-+  PFN_vkDestroyImage pfn_vkDestroyImage_ = nullptr;
-+  PFN_vkDeviceWaitIdle pfn_vkDeviceWaitIdle_ = nullptr;
-+  PFN_vkEndCommandBuffer pfn_vkEndCommandBuffer_ = nullptr;
-+  PFN_vkFreeCommandBuffers pfn_vkFreeCommandBuffers_ = nullptr;
-+  PFN_vkFreeMemory pfn_vkFreeMemory_ = nullptr;
-+  PFN_vkGetImageDrmFormatModifierPropertiesEXT pfn_vkGetImageDrmFormatModifierPropertiesEXT_ = nullptr;
-+  PFN_vkGetImageMemoryRequirements pfn_vkGetImageMemoryRequirements_ = nullptr;
-+  PFN_vkGetMemoryFdKHR pfn_vkGetMemoryFdKHR_ = nullptr;
-+  PFN_vkGetPhysicalDeviceMemoryProperties pfn_vkGetPhysicalDeviceMemoryProperties_ = nullptr;
-+  PFN_vkQueueSubmit pfn_vkQueueSubmit_ = nullptr;
-+  PFN_vkResetFences pfn_vkResetFences_ = nullptr;
-+  PFN_vkWaitForFences pfn_vkWaitForFences_ = nullptr;
++  PFN_vkCmdCopyImage vkCmdCopyImage_ = nullptr;
 +};
 +
 +}  // namespace device
@@ -793,7 +708,7 @@ index 0000000000..1d97845822
 +}  // namespace device
 diff --git a/device/vr/openxr/linux/openxr_platform_helper_linux.h b/device/vr/openxr/linux/openxr_platform_helper_linux.h
 new file mode 100644
-index 0000000000..17af1a1df1
+index 0000000000..a922dbf431
 --- /dev/null
 +++ b/device/vr/openxr/linux/openxr_platform_helper_linux.h
 @@ -0,0 +1,27 @@
