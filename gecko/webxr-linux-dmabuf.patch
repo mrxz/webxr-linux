@@ -20,7 +20,7 @@ diff --git a/gfx/vr/VRManager.cpp b/gfx/vr/VRManager.cpp
    MOZ_ASSERT(mBrowserState.layerState[0].type ==
               VRLayerType::LayerType_Stereo_Immersive);
    VRLayer_Stereo_Immersive& layer =
-@@ -1426,6 +1429,16 @@ bool VRManager::SubmitFrame(const layers
+@@ -1427,6 +1430,16 @@ bool VRManager::SubmitFrame(const layers
        layer.textureSize.width = desc.size().width;
        layer.textureSize.height = desc.size().height;
      } break;
@@ -37,7 +37,7 @@ diff --git a/gfx/vr/VRManager.cpp b/gfx/vr/VRManager.cpp
  #  endif
      default: {
        MOZ_ASSERT(false);
-@@ -1488,7 +1501,7 @@ void VRManager::SubmitFrameInternal(cons
+@@ -1489,7 +1502,7 @@ void VRManager::SubmitFrameInternal(cons
      mCurrentSubmitTask = nullptr;
    }
  
@@ -70,10 +70,46 @@ diff --git a/gfx/vr/VRShMem.cpp b/gfx/vr/VRShMem.cpp
    }
  }
  
+@@ -418,11 +426,12 @@ void VRShMem::PushBrowserState(VRBrowser
+   status = lock.GetStatus();
+ #  endif  // defined(XP_WIN)
+ 
+-  if (status) {
++  if (status && pthread_mutex_lock((pthread_mutex_t*)&(mExternalShmem->geckoMutex)) == 0) {
+     mExternalShmem->geckoGenerationA = mExternalShmem->geckoGenerationA + 1;
+     memcpy((void*)&(mExternalShmem->geckoState), (void*)&aBrowserState,
+            sizeof(VRBrowserState));
+     mExternalShmem->geckoGenerationB = mExternalShmem->geckoGenerationB + 1;
++    pthread_mutex_unlock((pthread_mutex_t*)&(mExternalShmem->geckoMutex));
+   }
+ #endif    // defined(MOZ_WIDGET_ANDROID)
+ }
+@@ -462,17 +471,15 @@ void VRShMem::PullBrowserState(mozilla::
+   }
+ #  endif  // defined(XP_WIN)
+   if (status) {
+-    VRExternalShmem tmp;
+     if (mExternalShmem->geckoGenerationA != mBrowserGeneration) {
+       // TODO - (void *) cast removes volatile semantics.
+       // The memcpy is not likely to be optimized out, but is theoretically
+       // possible.  Suggest refactoring to either explicitly enforce memory
+       // order or to use locks.
+-      memcpy(&tmp, (void*)mExternalShmem, sizeof(VRExternalShmem));
+-      if (tmp.geckoGenerationA == tmp.geckoGenerationB &&
+-          tmp.geckoGenerationA != 0) {
+-        memcpy(&aState, &tmp.geckoState, sizeof(VRBrowserState));
+-        mBrowserGeneration = tmp.geckoGenerationA;
++      if (pthread_mutex_lock((pthread_mutex_t*)&(mExternalShmem->geckoMutex)) == 0) {
++        memcpy(&aState, (void*)&(mExternalShmem->geckoState), sizeof(VRBrowserState));
++        mBrowserGeneration = mExternalShmem->geckoGenerationA;
++        pthread_mutex_unlock((pthread_mutex_t*)&(mExternalShmem->geckoMutex));
+       }
+     }
+   }
 diff --git a/gfx/vr/external_api/moz_external_vr.h b/gfx/vr/external_api/moz_external_vr.h
 --- a/gfx/vr/external_api/moz_external_vr.h
 +++ b/gfx/vr/external_api/moz_external_vr.h
-@@ -451,7 +451,8 @@ enum class VRLayerTextureType : uint16_t
+@@ -452,7 +452,8 @@ enum class VRLayerTextureType : uint16_t
    LayerTextureType_None = 0,
    LayerTextureType_D3D10SurfaceDescriptor = 1,
    LayerTextureType_MacIOSurface = 2,
@@ -83,6 +119,14 @@ diff --git a/gfx/vr/external_api/moz_external_vr.h b/gfx/vr/external_api/moz_ext
  };
  
  struct VRLayer_2D_Content {
+@@ -619,6 +620,7 @@ struct VRExternalShmem {
+   pthread_cond_t servoCond;
+ #else
+   int64_t generationA;
++  pthread_mutex_t geckoMutex;
+ #endif  // defined(__ANDROID__)
+   VRSystemState state;
+ #if !defined(__ANDROID__)
 diff --git a/gfx/vr/ipc/VRLayerChild.cpp b/gfx/vr/ipc/VRLayerChild.cpp
 --- a/gfx/vr/ipc/VRLayerChild.cpp
 +++ b/gfx/vr/ipc/VRLayerChild.cpp
@@ -111,7 +155,7 @@ diff --git a/gfx/vr/moz.build b/gfx/vr/moz.build
 diff --git a/gfx/vr/service/OSVRSession.cpp b/gfx/vr/service/OSVRSession.cpp
 --- a/gfx/vr/service/OSVRSession.cpp
 +++ b/gfx/vr/service/OSVRSession.cpp
-@@ -497,7 +497,7 @@ bool OSVRSession::SubmitFrame(
+@@ -496,7 +496,7 @@ bool OSVRSession::SubmitFrame(
    return false;
    // TODO Implement
  }
@@ -135,7 +179,7 @@ diff --git a/gfx/vr/service/OSVRSession.h b/gfx/vr/service/OSVRSession.h
 diff --git a/gfx/vr/service/OpenVRSession.cpp b/gfx/vr/service/OpenVRSession.cpp
 --- a/gfx/vr/service/OpenVRSession.cpp
 +++ b/gfx/vr/service/OpenVRSession.cpp
-@@ -1284,6 +1284,13 @@ bool OpenVRSession::SubmitFrame(
+@@ -1273,6 +1273,13 @@ bool OpenVRSession::SubmitFrame(
    return SubmitFrame(aTexture, ::vr::ETextureType::TextureType_IOSurface,
                       aLayer.leftEyeRect, aLayer.rightEyeRect);
  }
@@ -149,7 +193,7 @@ diff --git a/gfx/vr/service/OpenVRSession.cpp b/gfx/vr/service/OpenVRSession.cpp
  #endif
  
  bool OpenVRSession::SubmitFrame(const VRLayerTextureHandle& aTextureHandle,
-@@ -1303,32 +1310,32 @@ bool OpenVRSession::SubmitFrame(const VR
+@@ -1292,32 +1299,32 @@ bool OpenVRSession::SubmitFrame(const VR
  
    CFTypeRefPtr<IOSurfaceRef> ioSurface = surf->GetIOSurfaceRef();
    tex.handle = (void*)ioSurface.get();
@@ -232,7 +276,7 @@ diff --git a/gfx/vr/service/PuppetSession.h b/gfx/vr/service/PuppetSession.h
 diff --git a/gfx/vr/service/VRSession.cpp b/gfx/vr/service/VRSession.cpp
 --- a/gfx/vr/service/VRSession.cpp
 +++ b/gfx/vr/service/VRSession.cpp
-@@ -12,6 +12,10 @@
+@@ -14,6 +14,10 @@
  #  include <d3d11.h>
  #endif  // defined(XP_WIN)
  
@@ -243,7 +287,7 @@ diff --git a/gfx/vr/service/VRSession.cpp b/gfx/vr/service/VRSession.cpp
  #if defined(MOZILLA_INTERNAL_API)
  #  if defined(XP_WIN)
  #    include "mozilla/gfx/Logging.h"
-@@ -148,6 +152,30 @@ bool VRSession::SubmitFrame(
+@@ -152,6 +156,30 @@ bool VRSession::SubmitFrame(
      return SubmitFrame(aLayer, aLayer.textureHandle);
    }
  
@@ -305,7 +349,7 @@ diff --git a/gfx/vr/service/VRSession.h b/gfx/vr/service/VRSession.h
 diff --git a/gfx/vr/service/moz.build b/gfx/vr/service/moz.build
 --- a/gfx/vr/service/moz.build
 +++ b/gfx/vr/service/moz.build
-@@ -32,6 +32,8 @@ if CONFIG["OS_TARGET"] in ("WINNT", "Lin
+@@ -35,6 +35,8 @@ if CONFIG["TARGET_OS"] in ("WINNT", "OSX
          "openvr",
      ]
      LOCAL_INCLUDES += ["/dom/base", "/gfx/layers/d3d11"]
@@ -314,7 +358,7 @@ diff --git a/gfx/vr/service/moz.build b/gfx/vr/service/moz.build
  
      # OpenVRSession includes MacIOSurface.h which includes Mac headers
      # which define Size and Points types in the root namespace that
-@@ -45,4 +47,8 @@ if CONFIG["OS_TARGET"] in ("WINNT", "Lin
+@@ -48,4 +50,8 @@ if CONFIG["TARGET_OS"] in ("WINNT", "OSX
          "OpenVRViveMapper.cpp",
      ]
  
