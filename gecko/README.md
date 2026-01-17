@@ -11,7 +11,7 @@ In order to apply and compile this patch, it's important that you are able to co
 Once you have the Firefox code base locally, apply **one** of the patch files. The following command is for the `webxr-linux-dmabuf.patch` file (recommended):
 
 ```
-hg patch --no-commit path/to/webxr-linux-dmabuf.patch
+git apply path/to/webxr-linux-dmabuf.patch
 ```
 
 Once applied, build using `./mach build` and if everything goes well, you should now have a built version with WebXR support. Run it using `./mach run`. There are some settings you will have to enable in `about:config`:
@@ -24,8 +24,8 @@ Once applied, build using `./mach build` and if everything goes well, you should
 After configuring the above preferences, be sure to restart the firefox instance, as some of these only take effect on startup of Firefox.
 
 You are now ready to go and visit any WebXR experience on the web. Examples:
- * https://mixedreality.mozilla.org/hello-webxr/
- * https://immersive-web.github.io/webxr-samples/report/
+ * Hello WebXR: https://msub2.github.io/hello-webxr/
+ * WebXR Samples: https://immersive-web.github.io/webxr-samples/
 
 # How it works
 Firefox already contains all the relevant logic for handling the JS side of the WebXR specification and supports the OpenVR (Steam specific) runtime. Since SteamVR also works under Linux, the only missing part is actually submitting the frame data to the VRCompositor.
